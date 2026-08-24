@@ -11,7 +11,7 @@ from backend.core.llm.factory import create_llm
 from backend.core.tool.registry import ToolRegistry
 from backend.tools import register_all_tools
 import asyncio
-from backend.core.memory.store import save_message, get_messages, update_user_profile, save_user_memories, recall_user_memories
+from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories
 from backend.core.memory.extractor import ProfileExtractor
 router = APIRouter()
 
@@ -85,14 +85,17 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
 
 
 async def _extract_and_save(user_id: int, goal: str) -> None:
-    """后台提炼记忆并更新 —— 不阻塞回复，失败静默"""
+    """后台提炼记忆并更新 —— 不阻塞回复，失败静默
+    读-合并-写：先读旧画像当合并底子，LLM 把「旧画像+本轮对话」合并成全量画像，再覆盖写
+    （否则每轮只提炼本轮内容，会把之前的画像冲掉，长期记忆不累积）"""
     try:
         llm = create_llm()
         extractor = ProfileExtractor(llm)
-        sentences = await extractor.extract(f"用户：{goal}")
+        old_profile = await get_user_profile(user_id)              # ① 读旧画像（合并的底子）
+        sentences = await extractor.extract(f"用户：{goal}", old_profile=old_profile)  # ② 合并提炼
         if sentences:                         # 提炼出内容才更新，空列表不覆盖旧记忆
-            await save_user_memories(user_id, sentences)                # 主：多条记忆向量化
-            await update_user_profile(user_id, "；".join(sentences))    # 兜底：一句话画像表
+            await save_user_memories(user_id, sentences)                # ③ 覆盖写全量：多条记忆向量化
+            await update_user_profile(user_id, "；".join(sentences))    # 兜底：一句话画像表同步
     except Exception:
         pass                                  # 记忆提炼失败不影响主流程
 
