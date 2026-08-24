@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# 环境变量
+.env
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 数据库
+*.db
+*.sqlite3
+migrations/versions/
+qdrant_data/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Docker
+docker/data/
+
+# 日志
+logs/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
