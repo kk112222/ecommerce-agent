@@ -11,9 +11,9 @@ class UserProfileTool(BaseTool):
         parameters={
             "type":"object",
             "properties":{
-                "properties":{"type":"string","description":"会员等级：vip/svip/normal，不填则查全部"},
-            "required":[]
-            }
+                "level": {"type":"string","description":"会员等级：vip/svip/normal，不填则查全部"},
+            },
+            "required": []
         }
     )
     async def execute(self,level:str =None):
@@ -35,11 +35,12 @@ class UserProfileTool(BaseTool):
             rows = result.all()
             profile = {}
             for row in rows:
+                amount_yuan = round((row[2] or 0) / 100, 2)
                 profile[row[0]] = {
                     "总订单数": row[1],
-                    "总消费金额": row[2] or 0,
+                    "总消费金额(元)": amount_yuan,
                     "人数": row[3],
-                    "人均消费": round((row[2] or 0) / row[3], 2)
+                    "人均消费(元)": round(amount_yuan / row[3], 2)
                     if row[3] > 0 else 0,
                 }
             return ToolResult(
