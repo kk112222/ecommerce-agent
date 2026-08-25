@@ -3,6 +3,7 @@ import uuid
 from backend.core.llm.base import Message
 from backend.db.models.chat_message import ChatMessage
 from backend.db.models.user_profile import UserProfile
+from backend.db.models.uploaded_doc import UploadedDoc
 from backend.db.session import AsyncSessionLocal
 from backend.infrastructure.vector_store.embeddings import embed_text, embed_batch
 from backend.infrastructure.vector_store.qdrant_client import (
@@ -41,6 +42,7 @@ async def get_messages(sid: str, user_id: int,limit:int=10) -> str:
         lines.append(f"{who}: {msg.content}")
     return "\n".join(lines)
 async def get_user_profile(user_id:int) -> str:
+    #获取用户偏好
     async with AsyncSessionLocal() as db:
         row = (await db.execute(
             select(UserProfile).where(
@@ -50,6 +52,7 @@ async def get_user_profile(user_id:int) -> str:
         return row.preferences if row else ""
 
 async def update_user_profile(user_id:int,preferences:str) -> None:
+    """更新用户偏好"""
     async with AsyncSessionLocal() as db:
         row = (await db.execute(
             select(UserProfile).where(
@@ -86,3 +89,25 @@ async def recall_user_memories(user_id: int, query: str, top_k: int = 3) -> str:
     if hits:
         return "\n".join(h["text"] for h in hits)
     return await get_user_profile(user_id)   # 兜底：向量库还没有记忆时用一句话画像
+
+
+async def save_uploaded_doc(session_id: str, user_id: int, filename: str, content: str) -> None:
+    """存一条上传文件的解析结果（按会话关联，同一个 session 可传多个文件）"""
+    async with AsyncSessionLocal() as db:
+        db.add(UploadedDoc(session_id=session_id, user_id=user_id,
+                           filename=filename, content=content))
+        await db.commit()
+
+
+async def get_uploaded_docs(session_id: str, user_id: int) -> str:
+    """读该会话上传过的文件解析文本，拼成字符串（聊天时注入 Agent，供对比分析）"""
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(UploadedDoc).where(
+                UploadedDoc.session_id == session_id,
+                UploadedDoc.user_id == user_id,
+            ).order_by(UploadedDoc.id)
+        )).scalars().all()
+    if not rows:
+        return ""
+    return "\n\n".join(f"【上传文件：{r.filename}】\n{r.content}" for r in rows)

@@ -7,7 +7,8 @@ class Planner:
         self.llm = llm
         self.registry = registry
 
-    async def plan(self, goal: str, history: str = "", user_profile: str = "") -> list[dict]:
+    async def plan(self, goal: str, history: str = "", user_profile: str = "",
+                   uploaded_data: str = "") -> list[dict]:
         tool_list = "\n".join(
             f"- {tool.spec.name}: {tool.spec.description}"
             for tool in self.registry.tools.values()
@@ -31,6 +32,8 @@ class Planner:
             system_prompt += f"\n\n【历史对话背景】\n{history}"
         if user_profile:
             system_prompt += f"\n\n【用户画像】\n{user_profile}"
+        if uploaded_data:
+            system_prompt += f"\n\n【上传数据】\n{uploaded_data}"
         messages = [
             Message(role="system",content=system_prompt),
             Message(role="user",content=goal),

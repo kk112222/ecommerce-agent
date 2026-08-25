@@ -36,6 +36,7 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
             state["goal"],
             history=state.get("history", ""),
             user_profile=state.get("user_profile", ""),
+            uploaded_data=state.get("uploaded_data", ""),
         )
         if on_event:
             await on_event({"type": "plan", "plan": state["plan"]})
@@ -59,6 +60,7 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
             state["goal"], state["results"],
             history=state.get("history", ""),
             user_profile=state.get("user_profile", ""),
+            uploaded_data=state.get("uploaded_data", ""),
         ):
             full += chunk
             if on_event:

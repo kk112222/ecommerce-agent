@@ -14,6 +14,8 @@ def parse_file(filepath: Path) -> str:
         return _parse_docx(filepath)
     elif suffix in (".html", ".htm"):
         return _parse_html(filepath)
+    elif suffix in (".csv", ".tsv"):
+        return _parse_csv(filepath)
     else:
         # 未知格式当纯文本读
         return filepath.read_text(encoding="utf-8", errors="replace")
@@ -21,6 +23,19 @@ def parse_file(filepath: Path) -> str:
 
 def _parse_md(filepath: Path) -> str:
     return filepath.read_text(encoding="utf-8")
+
+
+def _parse_csv(filepath: Path) -> str:
+    """CSV/TSV → 表格文本（标准库 csv，零依赖）
+
+    utf-8-sig 兼容 Excel 导出时带 BOM 头的情况（否则第一列会多个 ﻿）
+    """
+    import csv
+    delimiter = "," if filepath.suffix.lower() == ".csv" else "\t"
+    with open(filepath, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=delimiter))
+    # 每行用 | 拼列，方便 LLM 读表格结构
+    return "\n".join(" | ".join(cell.strip() for cell in row) for row in rows)
 
 
 def _parse_pdf(filepath: Path) -> str:

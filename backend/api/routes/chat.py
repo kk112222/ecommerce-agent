@@ -11,7 +11,7 @@ from backend.core.llm.factory import create_llm
 from backend.core.tool.registry import ToolRegistry
 from backend.tools import register_all_tools
 import asyncio
-from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories
+from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories, get_uploaded_docs
 from backend.core.memory.extractor import ProfileExtractor
 router = APIRouter()
 
@@ -29,7 +29,9 @@ async def chat(request: ChatRequest, current_user: User = Depends(get_current_us
     await save_message(sid, current_user.id, "user", request.message)
     graph = build_supervisor(llm, registry)
     profile = await recall_user_memories(current_user.id, request.message)
-    final = await graph.invoke({"goal": request.message,"history": history_text,"user_profile": profile})
+    uploaded_data = await get_uploaded_docs(sid, current_user.id)
+    final = await graph.invoke({"goal": request.message, "history": history_text,
+                                "user_profile": profile, "uploaded_data": uploaded_data})
     result = final["report"]
     await save_message(sid, current_user.id, "assistant", result)
     asyncio.create_task(_extract_and_save(current_user.id, request.message))
@@ -47,7 +49,9 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
     history_text = await get_messages(sid, current_user.id)
     # ② 读用户画像（长期记忆）
     profile = await recall_user_memories(current_user.id, request.message)
-    # ③ 存当前问题
+    # ③ 读该会话上传的文件数据（对比分析用）
+    uploaded_data = await get_uploaded_docs(sid, current_user.id)
+    # ④ 存当前问题
     await save_message(sid, current_user.id, "user", request.message)
     goal = request.message
 
@@ -56,7 +60,8 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
 
         async def run_graph():                 # 后台任务：跑整个多 Agent 图
             graph = build_supervisor(llm, registry, on_event=lambda evt: queue.put(evt))
-            final = await graph.invoke({"goal": goal, "history": history_text, "user_profile": profile})
+            final = await graph.invoke({"goal": goal, "history": history_text,
+                                        "user_profile": profile, "uploaded_data": uploaded_data})
             # 图跑完，把完整报告落库（user 消息在请求进来时已存）
             report = final.get("report", "")
             if report:
