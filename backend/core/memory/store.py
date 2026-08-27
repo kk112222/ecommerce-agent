@@ -193,18 +193,17 @@ async def rename_session(session_id: str, user_id: int, title: str) -> None:
 
 
 async def delete_session(session_id: str, user_id: int) -> None:
-    """彻底删除会话：连同该会话下的消息一起物理删除（不可恢复）"""
+    """彻底删除会话：连同消息、上传文档一起物理删除（不可恢复）
+
+    注意：用户画像长期记忆（qdrant user_memories / user_profile 表）
+    是跨会话的"这个人"的记忆，不属于某个会话，删单个会话不清它。
+    """
     async with AsyncSessionLocal() as db:
-        await db.execute(
-            delete(ChatMessage).where(
-                ChatMessage.session_id == session_id,
-                ChatMessage.user_id == user_id,
+        for model in (ChatMessage, UploadedDoc, ChatSession):
+            await db.execute(
+                delete(model).where(
+                    model.session_id == session_id,
+                    model.user_id == user_id,
+                )
             )
-        )
-        await db.execute(
-            delete(ChatSession).where(
-                ChatSession.session_id == session_id,
-                ChatSession.user_id == user_id,
-            )
-        )
         await db.commit()
