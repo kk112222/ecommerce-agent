@@ -10,7 +10,7 @@ from backend.infrastructure.vector_store.embeddings import embed_text, embed_bat
 from backend.infrastructure.vector_store.qdrant_client import (
     ensure_collection, upsert_docs, search_similar, delete_by_user,
 )
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 
 MEMORY_COLLECTION = "user_memories"  # 用户记忆的 qdrant collection（和知识库 kb_docs 分开）
 
@@ -193,14 +193,18 @@ async def rename_session(session_id: str, user_id: int, title: str) -> None:
 
 
 async def delete_session(session_id: str, user_id: int) -> None:
-    """软删除会话：记录留着（同一 sid 复用时自动恢复），侧边栏列表不再显示"""
+    """彻底删除会话：连同该会话下的消息一起物理删除（不可恢复）"""
     async with AsyncSessionLocal() as db:
-        row = (await db.execute(
-            select(ChatSession).where(
+        await db.execute(
+            delete(ChatMessage).where(
+                ChatMessage.session_id == session_id,
+                ChatMessage.user_id == user_id,
+            )
+        )
+        await db.execute(
+            delete(ChatSession).where(
                 ChatSession.session_id == session_id,
                 ChatSession.user_id == user_id,
             )
-        )).scalars().first()
-        if row:
-            row.is_deleted = True
-            await db.commit()
+        )
+        await db.commit()

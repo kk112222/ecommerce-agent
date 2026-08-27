@@ -6,7 +6,7 @@ import DashboardPage from './DashboardPage';
 import LoginPage from './LoginPage';
 import SessionSidebar from './SessionSidebar';
 import { isLoggedIn, clearToken } from './auth';
-import { fetchSessions, deleteSession, type SessionInfo } from './api';
+import { fetchSessions, renameSession, deleteSession, type SessionInfo } from './api';
 
 const { Sider, Content } = Layout;
 const { Text } = Typography;
@@ -88,9 +88,19 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
       await deleteSession(sid);
     } catch {
       message.error('删除会话失败');
+      return;
     }
     if (sid === activeSessionId) newChat();   // 删的是当前会话 → 回到新对话
     refreshSessions();
+  }
+  /** 重命名会话：成功后刷新列表（标题会变） */
+  async function handleRenameSession(sid: string, title: string) {
+    try {
+      await renameSession(sid, title);
+      refreshSessions();
+    } catch {
+      message.error('重命名失败');
+    }
   }
 
   function handleLogout() {
@@ -136,6 +146,7 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
           activeId={activeSessionId}
           onSelect={selectSession}
           onNew={newChat}
+          onRename={handleRenameSession}
           onDelete={handleDeleteSession}
         />
       )}

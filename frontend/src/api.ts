@@ -169,16 +169,18 @@ export async function fetchSessionMessages(sid: string): Promise<HistoryMsg[]> {
 
 /** 重命名会话标题 */
 export async function renameSession(sid: string, title: string): Promise<void> {
-  await fetch(`/api/sessions/${encodeURIComponent(sid)}`, {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`, {
     method: 'PATCH',
     headers: authHeaders(),
     body: JSON.stringify({ title }),
   });
+  if (!res.ok) throw new Error(`重命名失败: ${res.status}`);
 }
 
-/** 删除会话（软删除，侧边栏不再显示） */
+/** 彻底删除会话（后端连消息一起物理删除，不可恢复） */
 export async function deleteSession(sid: string): Promise<void> {
-  await fetch(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE', headers: authHeaders() });
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE', headers: authHeaders() });
+  if (!res.ok) throw new Error(`删除失败: ${res.status}`);
 }
 
 /** 上传文件的解析结果（对应后端 /api/upload 返回） */

@@ -4,7 +4,7 @@
 - GET    /api/sessions            当前用户会话列表（最近活跃倒序）
 - GET    /api/sessions/{sid}/messages   某会话历史消息（切换时加载）
 - PATCH  /api/sessions/{sid}      重命名标题
-- DELETE /api/sessions/{sid}      删除（软删除，列表不再显示）
+- DELETE /api/sessions/{sid}      彻底删除（连消息一起物理删除，不可恢复）
 """
 from fastapi import APIRouter, Depends
 
@@ -40,6 +40,6 @@ async def rename(sid: str, body: SessionRenameRequest,
 
 @router.delete("/sessions/{sid}")
 async def remove(sid: str, current_user: User = Depends(get_current_user)):
-    """删除会话（软删除：记录留着，侧边栏不再显示）"""
+    """删除会话（彻底删除：会话和消息一起物理删除）"""
     await delete_session(sid, current_user.id)
     return {"ok": True}
