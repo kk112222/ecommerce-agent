@@ -57,11 +57,15 @@ export interface DashboardInsight {
   insight: string;        // LLM 生成的 markdown 洞察
   cost_ms: number;        // 生成耗时（毫秒）
   error: string | null;   // LLM 失败时的错误信息（正常为 null）
+  from_cache?: boolean;   // true = 命中当天缓存秒回，未重新调 LLM
 }
 
-/** 获取 AI 经营洞察（后端把看板数据快照喂给 LLM，返回自然语言解读） */
-export async function fetchDashboardInsight(): Promise<DashboardInsight> {
-  const res = await fetch('/api/dashboard/insight', { headers: authHeaders() });
+/**
+ * 获取 AI 经营洞察（后端把看板数据快照喂给 LLM，返回自然语言解读）
+ * @param refresh 默认 false 走当天缓存（秒开）；true 强制重新生成
+ */
+export async function fetchDashboardInsight(refresh = false): Promise<DashboardInsight> {
+  const res = await fetch(`/api/dashboard/insight${refresh ? '?refresh=true' : ''}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`请求失败: ${res.status}`);
   return res.json();
 }

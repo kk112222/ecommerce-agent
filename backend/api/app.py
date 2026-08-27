@@ -10,6 +10,9 @@ from backend.api.routes.auth import router as auth_router
 from backend.api.routes.upload import router as upload_router
 from backend.api.routes.session import router as session_router
 from backend.api.middleware import RequestLogMiddleware, ExceptionHandlerMiddleware
+from backend.db.models.base import Base
+from backend.db.models.insight_cache import InsightCache  # noqa: F401 触发注册（让 metadata 发现新表）
+from backend.db.session import engine
 
 # 配置日志
 logging.basicConfig(
@@ -19,6 +22,13 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="电商运营 AI Agent")
+
+
+@app.on_event("startup")
+async def _ensure_tables():
+    """幂等补建缺失的表（新增表不用重跑 init_db，create_all 只建缺的，不清已有数据）"""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 # ===== 中间件（注册顺序 = 从内到外的包裹顺序）=====
 

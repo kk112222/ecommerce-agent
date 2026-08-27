@@ -67,21 +67,22 @@ export default function DashboardPage() {
 
   useEffect(() => { load(); }, [load]);
 
-  // ============ AI 经营洞察（看板底部那块，点击才生成，避免每次刷新都慢） ============
-  const [insight, setInsight] = useState<{ text: string; costMs: number } | null>(null);
+  // ============ AI 经营洞察（看板底部：打开自动加载，命中当天缓存秒开） ============
+  const [insight, setInsight] = useState<{ text: string; costMs: number; fromCache?: boolean } | null>(null);
   const [insightLoading, setInsightLoading] = useState(false);
   const [insightError, setInsightError] = useState<string | null>(null);
 
-  const generateInsight = useCallback(async () => {
+  /** refresh=false 走当天缓存（命中秒开）；true 强制重新生成 */
+  const generateInsight = useCallback(async (refresh = false) => {
     setInsightLoading(true);
     setInsightError(null);
     try {
-      const r = await fetchDashboardInsight();
+      const r = await fetchDashboardInsight(refresh);
       if (r.error) {                       // 后端 LLM 调用失败：提示，不崩页面
         setInsightError(r.error);
         setInsight(null);
       } else {
-        setInsight({ text: r.insight, costMs: r.cost_ms });
+        setInsight({ text: r.insight, costMs: r.cost_ms, fromCache: r.from_cache });
       }
     } catch (e) {
       setInsightError(e instanceof Error ? e.message : '生成失败');
@@ -90,6 +91,9 @@ export default function DashboardPage() {
       setInsightLoading(false);
     }
   }, []);
+
+  // 打开看板自动加载一次：命中当天缓存秒开，未命中自动生成（首次略等）
+  useEffect(() => { generateInsight(false); }, [generateInsight]);
 
   // ============ 看板数据 → 图表数据 ============
   const trendData = dashboard?.["近7日趋势"] ?? [];
@@ -232,7 +236,7 @@ export default function DashboardPage() {
             extra={
               <Button
                 size="small" type="primary" icon={<ThunderboltOutlined />}
-                loading={insightLoading} onClick={generateInsight}
+                loading={insightLoading} onClick={() => generateInsight(true)}
                 style={{ fontWeight: 600 }}
               >
                 {insight ? '重新生成' : '生成洞察'}
@@ -263,7 +267,7 @@ export default function DashboardPage() {
               <div style={{ color: C.text }}>
                 <ReactMarkdown components={mdComponents}>{insight.text}</ReactMarkdown>
                 <Text style={{ fontSize: 11, color: C.textWeak, fontFamily: C.mono }}>
-                  生成耗时 {insight.costMs}ms
+                  生成耗时 {insight.costMs}ms{insight.fromCache ? ' · 当天缓存' : ''}
                 </Text>
               </div>
             )}

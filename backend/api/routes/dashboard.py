@@ -11,6 +11,7 @@ from backend.db.session import AsyncSessionLocal
 from backend.db.models.order import Order
 from backend.db.models.product import Product
 from backend.db.models.user import User
+from backend.db.models.insight_cache import InsightCache
 from backend.core.llm.factory import create_llm
 from backend.core.llm.base import Message
 
@@ -133,18 +134,65 @@ def _build_insight_prompt(data: dict) -> str:
 {top_lines}
 
 【输出要求】
-1. 输出 3~5 条要点，每条 = 观察 + 数字依据 + 一句行动建议
+1. 输出 3 条要点，每条 = 观察 + 数字依据 + 一句行动建议，每条不超过 40 字
 2. 优先指出：异常涨跌、库存风险、机会点（热销分类/商品）
 3. 如果今日数据为 0，明确指出"今日暂无数据"，建议核实同步，不要强行解读
-4. 用 markdown 无序列表（每项一行），语言像给运营的晨报，简洁直接"""
+4. 用 markdown 无序列表（每项一行），语言像给运营的晨报，简洁直接
+5. 全篇不超过 160 字（LLM 输出越短响应越快）"""
+
+
+async def _get_insight_cache(user_id: int) -> InsightCache | None:
+    """取当天缓存（用户 + 今天日期，数据按天聚合所以缓存粒度是一天）"""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    async with AsyncSessionLocal() as db:
+        return (await db.execute(
+            select(InsightCache).where(
+                InsightCache.user_id == user_id,
+                InsightCache.cache_date == today_str,
+            )
+        )).scalars().first()
+
+
+async def _save_insight_cache(user_id: int, insight: str, error: str | None, cost_ms: int) -> None:
+    """覆盖写当天缓存（当天只有一条，重复生成就更新）"""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(
+            select(InsightCache).where(
+                InsightCache.user_id == user_id,
+                InsightCache.cache_date == today_str,
+            )
+        )).scalars().first()
+        if row:
+            row.insight, row.error, row.cost_ms = insight, error, cost_ms
+        else:
+            db.add(InsightCache(user_id=user_id, cache_date=today_str,
+                                insight=insight, error=error, cost_ms=cost_ms))
+        await db.commit()
 
 
 @router.get("/dashboard/insight")
 async def get_dashboard_insight(
+        refresh: bool = False,
         current_user: User = Depends(get_current_user),
 ):
-    """AI 经营洞察：把看板数据快照（含环比/明细/Top）喂给 LLM，返回自然语言经营解读"""
+    """AI 经营洞察：把看板数据快照（含环比/明细/Top）喂给 LLM，返回自然语言经营解读
+
+    - 默认走当天缓存：命中秒回（from_cache=True），未命中才生成
+    - ?refresh=true 强制重新生成并覆盖当天缓存（前端"重新生成"按钮用）
+    """
     start = time.time()
+
+    # 非刷新请求且当天已有缓存 → 直接返回，不再调 LLM（40s 变秒开）
+    if not refresh:
+        cached = await _get_insight_cache(current_user.id)
+        if cached:
+            return {
+                "insight": cached.insight,
+                "cost_ms": cached.cost_ms,
+                "error": cached.error,
+                "from_cache": True,
+            }
     today = datetime.now()
     today_start = today.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
@@ -232,8 +280,12 @@ async def get_dashboard_insight(
     except Exception as e:   # LLM 挂了返回空洞察 + 错误信息，前端兜底提示，不让看板崩
         insight, error = "", str(e)
 
+    cost_ms = round((time.time() - start) * 1000)
+    if not error:   # LLM 失败不写缓存，下次打开自动重试；成功才缓存当天结果
+        await _save_insight_cache(current_user.id, insight, None, cost_ms)
     return {
         "insight": insight,
-        "cost_ms": round((time.time() - start) * 1000),
+        "cost_ms": cost_ms,
         "error": error,
+        "from_cache": False,
     }
