@@ -41,14 +41,19 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
 
   return (
     <div style={{
-      height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'linear-gradient(135deg, #e6f4ff 0%, #f9f0ff 100%)',
+      height: '100dvh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'radial-gradient(1200px 600px at 20% 0%, rgba(245,78,0,0.08) 0%, transparent 60%), linear-gradient(135deg, #15131c 0%, #1e1a28 100%)',
     }}>
-      <Card style={{ width: 380, boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}>
+      <Card style={{ width: 380, boxShadow: '0 12px 40px rgba(0,0,0,0.4)', borderColor: '#332d45' }}>
         <div style={{ textAlign: 'center', marginBottom: 24 }}>
-          <RobotOutlined style={{ fontSize: 48, color: '#1677ff' }} />
-          <Title level={4} style={{ margin: '12px 0 4px' }}>电商运营 AI Agent</Title>
-          <Text type="secondary">运营人员的智能副驾</Text>
+          <div style={{
+            width: 56, height: 56, borderRadius: 14, margin: '0 auto',
+            background: '#F54E00', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <RobotOutlined style={{ fontSize: 28, color: '#1a1723' }} />
+          </div>
+          <Title level={4} style={{ margin: '14px 0 4px', color: '#ece9f2' }}>电商运营 AI Agent</Title>
+          <Text style={{ color: '#a6a0b8' }}>运营人员的智能副驾</Text>
         </div>
 
         <Tabs

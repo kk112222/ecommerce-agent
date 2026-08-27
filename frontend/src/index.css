@@ -1,6 +1,12 @@
+/* 全局样式 —— PostHog 视觉语言：深藏紫蓝底 + 珊瑚橙主色 + mono 数字 */
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: #15131c;
+  color: #ece9f2;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #root {
@@ -8,6 +14,27 @@ body {
   max-width: 100%;
   margin: 0;
   text-align: left;
+}
+
+/* 深色主题滚动条，避免出现刺眼的白边 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a3450;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4a4370;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 看板数字/数据用等宽字体（PostHog 数据面板的惯例） */
+.stat-mono {
+  font-family: 'JetBrains Mono', 'Source Code Pro', Consolas, 'Courier New', monospace;
 }
 
 /* 加载点点点动画 */

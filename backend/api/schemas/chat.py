@@ -7,4 +7,7 @@ class ChatResponse(BaseModel):
     reply: str  # LLM 的回复
     session_id: str
 
+class SessionRenameRequest(BaseModel):
+    title: str  # 会话新标题（手动重命名）
+
 

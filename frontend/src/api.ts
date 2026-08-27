@@ -52,6 +52,20 @@ export async function fetchDashboard(): Promise<DashboardData> {
   return res.json();
 }
 
+/** AI 经营洞察的返回结构 */
+export interface DashboardInsight {
+  insight: string;        // LLM 生成的 markdown 洞察
+  cost_ms: number;        // 生成耗时（毫秒）
+  error: string | null;   // LLM 失败时的错误信息（正常为 null）
+}
+
+/** 获取 AI 经营洞察（后端把看板数据快照喂给 LLM，返回自然语言解读） */
+export async function fetchDashboardInsight(): Promise<DashboardInsight> {
+  const res = await fetch('/api/dashboard/insight', { headers: authHeaders() });
+  if (!res.ok) throw new Error(`请求失败: ${res.status}`);
+  return res.json();
+}
+
 /** 计划项（Planner 拆出的子任务） */
 export interface PlanItem {
   id: string;
@@ -115,4 +129,83 @@ export async function sendMessageStream(
   }
 
   return finalSessionId;
+}
+
+/** 构造仅带 token 的请求头 —— multipart 上传不能预设 Content-Type，
+ * 否则 fetch 不会自动补 boundary，后端会解析失败 */
+function authTokenHeaders(): Record<string, string> {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/** 会话元信息（对应后端 /api/sessions 返回的列表项） */
+export interface SessionInfo {
+  id: string;
+  title: string;
+  msg_count: number;
+  updated_at: string;
+}
+
+/** 某会话的一条历史消息（对应后端 /api/sessions/{sid}/messages） */
+export interface HistoryMsg {
+  role: 'user' | 'assistant';
+  content: string;
+  created_at: string;
+}
+
+/** 获取当前用户的会话列表（侧边栏用，按最近活跃倒序） */
+export async function fetchSessions(): Promise<SessionInfo[]> {
+  const res = await fetch('/api/sessions', { headers: authHeaders() });
+  if (!res.ok) throw new Error(`请求失败: ${res.status}`);
+  return res.json();
+}
+
+/** 获取某个会话的历史消息（切换会话时加载） */
+export async function fetchSessionMessages(sid: string): Promise<HistoryMsg[]> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/messages`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`请求失败: ${res.status}`);
+  return res.json();
+}
+
+/** 重命名会话标题 */
+export async function renameSession(sid: string, title: string): Promise<void> {
+  await fetch(`/api/sessions/${encodeURIComponent(sid)}`, {
+    method: 'PATCH',
+    headers: authHeaders(),
+    body: JSON.stringify({ title }),
+  });
+}
+
+/** 删除会话（软删除，侧边栏不再显示） */
+export async function deleteSession(sid: string): Promise<void> {
+  await fetch(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE', headers: authHeaders() });
+}
+
+/** 上传文件的解析结果（对应后端 /api/upload 返回） */
+export interface UploadResult {
+  filename: string;
+  chars: number;
+  preview: string;
+}
+
+/**
+ * 上传数据文件（CSV/PDF/MD...）到当前会话
+ * @param file 选择的文件
+ * @param sessionId 会话 ID（上传的文件挂在这个会话下，聊天时 Agent 才能读到）
+ */
+export async function uploadFile(file: File, sessionId: string): Promise<UploadResult> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('session_id', sessionId);
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    headers: authTokenHeaders(),
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail = body?.detail;
+    throw new Error(typeof detail === 'string' ? detail : `上传失败: ${res.status}`);
+  }
+  return res.json();
 }

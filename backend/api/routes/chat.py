@@ -11,7 +11,7 @@ from backend.core.llm.factory import create_llm
 from backend.core.tool.registry import ToolRegistry
 from backend.tools import register_all_tools
 import asyncio
-from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories, get_uploaded_docs
+from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories, get_uploaded_docs, upsert_session
 from backend.core.memory.extractor import ProfileExtractor
 router = APIRouter()
 
@@ -27,6 +27,7 @@ async def chat(request: ChatRequest, current_user: User = Depends(get_current_us
     register_all_tools(registry, llm)
     history_text = await get_messages(sid, current_user.id)
     await save_message(sid, current_user.id, "user", request.message)
+    await upsert_session(sid, current_user.id, request.message)   # 同步会话元信息（多会话列表）
     graph = build_supervisor(llm, registry)
     profile = await recall_user_memories(current_user.id, request.message)
     uploaded_data = await get_uploaded_docs(sid, current_user.id)
@@ -53,6 +54,7 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
     uploaded_data = await get_uploaded_docs(sid, current_user.id)
     # ④ 存当前问题
     await save_message(sid, current_user.id, "user", request.message)
+    await upsert_session(sid, current_user.id, request.message)   # 同步会话元信息（多会话列表）
     goal = request.message
 
     async def event_stream():

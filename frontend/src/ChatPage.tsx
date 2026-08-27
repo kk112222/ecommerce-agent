@@ -1,72 +1,105 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Input, Button, Card, Typography, Space, Tag, message, Statistic, Row, Col, Collapse } from 'antd';
 import {
-  SendOutlined, RobotOutlined, UserOutlined, DeleteOutlined,
-  DashboardOutlined, ShoppingCartOutlined,
-  WarningOutlined, LogoutOutlined,
+  Input, Button, Card, Typography, Space, Tag, message, Upload,
+} from 'antd';
+import {
+  SendOutlined, RobotOutlined, UserOutlined,
+  UploadOutlined, FileTextOutlined, ProfileOutlined, ToolOutlined,
 } from '@ant-design/icons';
-import { sendMessageStream, fetchDashboard, type DashboardData, type StreamEvent, type PlanItem } from './api';
-import { clearToken } from './auth';
+import {
+  sendMessageStream, uploadFile, fetchSessionMessages,
+  type StreamEvent, type PlanItem, type UploadResult,
+} from './api';
+import TracePanel, { type TraceStep } from './TracePanel';
 import ReactMarkdown from 'react-markdown';
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
 
-// 意图 → 显示文案（supervisor 条件边分类结果）
-const intentLabels: Record<string, string> = {
-  analysis: '📊 数据分析',
-  content: '✍️ 内容生成',
-  service: '🛟 客服问答',
+// ============ PostHog 视觉语言 → 局部样式常量 ============
+// （主题色在 App.tsx 的 ConfigProvider 里统一定义，这里只放组件局部要用的）
+const C = {
+  bg: '#15131c',          // 页面底
+  surface: '#1e1a28',     // 卡片表面
+  surface2: '#262233',    // 次级表面（子任务卡片）
+  border: '#332d45',
+  borderSoft: '#2a2539',
+  accent: '#F54E00',      // 珊瑚橙主色
+  accentText: '#1a1723',  // 橙底上的深色文字
+  yellow: '#FFE14D',      // PostHog 荧光黄（辅助强调）
+  text: '#ece9f2',
+  textSec: '#a6a0b8',
+  textWeak: '#7a748c',
+  mono: "'JetBrains Mono','Source Code Pro',Consolas,monospace",
 };
 
-// markdown 渲染样式：标题用 antd 排版，和整体风格统一
+// 意图 → 显示文案 + 强调色（supervisor 条件边分类结果；图标用 SVG，不堆 emoji）
+const intentLabels: Record<string, string> = {
+  analysis: '数据分析',
+  content: '内容生成',
+  service: '客服问答',
+};
+const intentColor: Record<string, string> = {
+  analysis: '#ff7a3d',
+  content: '#e8c92f',
+  service: '#9a8cff',
+};
+
+// markdown 渲染样式：深色主题适配，标题用 antd 排版
 const mdComponents = {
-  h1: ({ node: _n, ...props }: any) => <Title level={4} style={{ marginTop: 12, marginBottom: 8 }} {...props} />,
-  h2: ({ node: _n, ...props }: any) => <Title level={5} style={{ marginTop: 12, marginBottom: 8 }} {...props} />,
-  h3: ({ node: _n, ...props }: any) => <Title level={5} style={{ marginTop: 10, marginBottom: 6 }} {...props} />,
+  h1: ({ node: _n, ...props }: any) => <Title level={4} style={{ marginTop: 12, marginBottom: 8, color: C.text }} {...props} />,
+  h2: ({ node: _n, ...props }: any) => <Title level={5} style={{ marginTop: 12, marginBottom: 8, color: C.text }} {...props} />,
+  h3: ({ node: _n, ...props }: any) => <Title level={5} style={{ marginTop: 10, marginBottom: 6, color: C.text }} {...props} />,
   p: ({ node: _n, ...props }: any) => <p style={{ margin: '4px 0' }} {...props} />,
   ul: ({ node: _n, ...props }: any) => <ul style={{ margin: '4px 0', paddingLeft: 20 }} {...props} />,
   ol: ({ node: _n, ...props }: any) => <ol style={{ margin: '4px 0', paddingLeft: 20 }} {...props} />,
   li: ({ node: _n, ...props }: any) => <li style={{ margin: '2px 0' }} {...props} />,
   blockquote: ({ node: _n, ...props }: any) => (
-    <blockquote style={{ margin: '4px 0', paddingLeft: 12, borderLeft: '3px solid #d9d9d9', color: '#888' }} {...props} />
+    <blockquote style={{ margin: '4px 0', paddingLeft: 12, borderLeft: '3px solid #332d45', color: C.textSec }} {...props} />
   ),
+  a: ({ node: _n, ...props }: any) => <a style={{ color: '#ff7a3d' }} {...props} />,
+  strong: ({ node: _n, ...props }: any) => <strong style={{ color: C.text }} {...props} />,
 };
 
 interface ChatMsg {
   role: 'user' | 'assistant' | 'plan' | 'subtask';
   content: string;
-  plan?: PlanItem[];    // plan 消息专用：Planner 拆出的子任务列表
-  subtaskId?: string;   // subtask 消息专用：哪个子任务
+  plan?: PlanItem[];
+  subtaskId?: string;
 }
 
 interface ChatPageProps {
-  onLogout?: () => void;
+  initialSessionId: string;                      // 进入本会话时 App 传入的会话 id（'' = 新对话）
+  onSessionIdChange: (sid: string) => void;      // 会话确定/变化时通知 App（刷新列表 + 高亮）
 }
 
-export default function ChatPage({ onLogout }: ChatPageProps) {
+export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPageProps) {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [sessionId, setSessionId] = useState('');
-  const [intent, setIntent] = useState('');   // 当前问题被分类到的意图
-  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
+  const [sessionId, setSessionId] = useState(initialSessionId);
+  const [intent, setIntent] = useState('');          // 当前问题被分类到的意图
+  const [steps, setSteps] = useState<TraceStep[]>([]);   // 本次提问的执行时间线
+  const [uploaded, setUploaded] = useState<UploadResult[]>([]);   // 本会话已上传的文件
+  const [uploading, setUploading] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const loadDashboard = useCallback(async () => {
-    try {
-      const data = await fetchDashboard();
-      setDashboard(data);
-    } catch { /* 静默 */ }
-  }, []);
-
-  useEffect(() => { loadDashboard(); }, [loadDashboard]);
-  useEffect(() => {
-    if (messages.length > 0 && !loading) loadDashboard();
-  }, [loading, messages.length, loadDashboard]);
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
-  }, [messages]);
+  }, [messages, steps]);
+
+  // 挂载时若带初始会话 id（从侧边栏切进来的历史会话），拉取历史消息填充
+  useEffect(() => {
+    if (!initialSessionId) return;
+    let alive = true;
+    (async () => {
+      try {
+        const history = await fetchSessionMessages(initialSessionId);
+        if (alive) setMessages(history.map(h => ({ role: h.role, content: h.content })));
+      } catch { /* 后端未启动或会话已删，保持空 */ }
+    })();
+    return () => { alive = false; };   // 防卸载后 setState
+  }, [initialSessionId]);
 
   // 追加/覆盖最后一个 assistant 气泡（报告打字机累积用）
   const appendAssistant = useCallback((content: string, replace = false) => {
@@ -74,7 +107,6 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
       const copy = [...prev];
       const last = copy[copy.length - 1];
       if (last && last.role === 'assistant') {
-        // 已有报告气泡：追加片段（打字机）或整体覆盖（收尾）
         copy[copy.length - 1] = { ...last, content: replace ? content : last.content + content };
       } else {
         copy.push({ role: 'assistant', content });
@@ -83,52 +115,117 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
     });
   }, []);
 
+  // 上传前确保有一个会话 ID：上传的文件挂在这个会话下，聊天时 Agent 才能读到
+  // 新对话还没 sid 时现场生成一个，并上报 App（高亮 + 刷新列表）
+  const ensureSessionId = () => {
+    if (!sessionId) {
+      const id = Math.random().toString(36).slice(2, 10);
+      setSessionId(id);
+      onSessionIdChange(id);
+      return id;
+    }
+    return sessionId;
+  };
+
+  // 选择文件后上传到后端（后端解析成文本，Agent 提问时注入做竞品对比）
+  async function handleUpload(file: File) {
+    const sid = ensureSessionId();
+    setUploading(true);
+    try {
+      const r = await uploadFile(file, sid);
+      setUploaded(prev => [...prev, r]);
+      message.success(`已上传 ${r.filename}（${r.chars} 字符），可直接提问做对比分析`);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '上传失败');
+    } finally {
+      setUploading(false);
+    }
+  }
+
   async function handleSend() {
     const text = input.trim();
     if (!text) return;
 
-    // 用户消息
     setMessages(prev => [...prev, { role: 'user', content: text }]);
     setInput('');
     setLoading(true);
 
-    // 流式接收
-    const pendingMsgs: ChatMsg[] = [];
-    const addPending = (msg: ChatMsg) => {
-      pendingMsgs.push(msg);
-      setMessages(prev => [...prev, msg]);
-    };
+    // 新一轮执行：重置时间线，先点亮"识别意图"
+    setSteps([{ id: 'intent', kind: 'intent', label: '识别意图', status: 'running', startedAt: Date.now() }]);
 
     try {
       await sendMessageStream(text, sessionId, (event: StreamEvent) => {
         switch (event.type) {
           case 'intent':
-            setIntent(event.intent);   // 显示路由到了哪条链路
+            setIntent(event.intent);
+            finishStep('intent', { label: `识别意图 · ${intentLabels[event.intent] ?? event.intent}` });
+            // 只有"数据分析"链路才有拆解计划 + 子任务阶段；
+            // 内容生成/客服问答是 ReAct 直接出结果，只推 report，不能加 plan 步骤（否则永远转圈）
+            if (event.intent === 'analysis') {
+              pushStep({ id: 'plan', kind: 'plan', label: '拆解执行计划', status: 'running', startedAt: Date.now() });
+            }
             break;
           case 'plan':
-            addPending({ role: 'plan', content: '', plan: event.plan });
+            finishStep('plan', { plan: event.plan });
+            // 计划拆出来后，为每个子任务建一个 running 步骤（执行完逐个打勾）
+            event.plan.forEach((p, i) => {
+              pushStep({
+                id: p.id, kind: 'subtask',
+                label: `子任务 ${i + 1}：${p.task}`,
+                status: 'running', startedAt: Date.now(),
+                toolHint: p.tool_hint,
+              });
+            });
             break;
           case 'subtask':
-            addPending({ role: 'subtask', content: event.result, subtaskId: event.id });
+            finishStep(event.id, { result: event.result.slice(0, 200) });
             break;
           case 'token':
-            appendAssistant(event.content);      // 逐字累积，打字机效果
+            // 第一次收到 token = 合成器开始流式生成报告，点亮"生成报告"步骤
+            pushStepIfAbsent({ id: 'report', kind: 'report', label: '生成最终报告', status: 'running', startedAt: Date.now() });
+            appendAssistant(event.content);
             break;
           case 'report':
-            appendAssistant(event.report, true); // 用完整报告覆盖，防丢字
+            appendAssistant(event.report, true);
+            finishStep('report', {});
             setLoading(false);
             break;
           case 'session':
             setSessionId(event.session_id);
+            onSessionIdChange(event.session_id);   // 通知 App 刷新会话列表 + 高亮
             break;
         }
       });
     } catch {
+      // 请求失败：把还卡在 running 的步骤标红，别让它一直转
+      setSteps(prev => prev.map(s => s.status === 'running' ? { ...s, status: 'error' } : s));
       message.error('请求失败，请确认后端已启动');
     } finally {
       setLoading(false);
     }
   }
+
+  // ============ 执行时间线的三个操作（SSE 事件驱动） ============
+
+  /** 完成某步骤：算耗时 + 打勾 */
+  const finishStep = (id: string, patch: Partial<TraceStep>) => {
+    setSteps(prev => prev.map(s =>
+      s.id === id ? {
+        ...s, ...patch, status: 'done',
+        costMs: Date.now() - (s.startedAt ?? Date.now()),
+      } : s
+    ));
+  };
+
+  /** 追加一个新步骤 */
+  const pushStep = (step: TraceStep) => {
+    setSteps(prev => [...prev, step]);
+  };
+
+  /** 仅当不存在时追加（防止 token 事件多次点亮"生成报告"） */
+  const pushStepIfAbsent = (step: TraceStep) => {
+    setSteps(prev => prev.some(s => s.id === step.id) ? prev : [...prev, step]);
+  };
 
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -137,112 +234,36 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
     }
   }
 
-  function handleClear() {
-    setMessages([]);
-    setSessionId('');
-  }
-
-  function handleLogout() {
-    clearToken();
-    onLogout?.();
-  }
-
   return (
-    <div style={{ maxWidth: 900, margin: '0 auto', height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* 顶部标题栏 */}
-      <Card size="small" style={{ borderRadius: 0, borderTop: 0 }}
-        styles={{ body: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }}>
-        <Space>
-          <RobotOutlined style={{ fontSize: 20, color: '#1677ff' }} />
-          <Title level={5} style={{ margin: 0 }}>电商运营 AI Agent</Title>
-          {intent && <Tag color="geekblue">{intentLabels[intent]}</Tag>}
-          {sessionId && <Tag color="blue">会话: {sessionId}</Tag>}
-        </Space>
-        <Space>
-          <Button icon={<DashboardOutlined />} size="small" onClick={loadDashboard}>刷新看板</Button>
-          <Button icon={<DeleteOutlined />} size="small" onClick={handleClear} disabled={messages.length === 0}>
-            清空
-          </Button>
-          <Button icon={<LogoutOutlined />} size="small" danger onClick={handleLogout}>
-            退出登录
-          </Button>
+    <div style={{ maxWidth: 1100, margin: '0 auto', height: '100dvh', display: 'flex', flexDirection: 'column', background: C.bg }}>
+      {/* ============ 顶部标题栏 ============ */}
+      <Card size="small" style={{ borderRadius: 0, borderTop: 0, borderBottom: `1px solid ${C.borderSoft}`, background: C.surface }}
+        styles={{ body: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 24px' } }}>
+        <Space size={12}>
+          <Title level={5} style={{ margin: 0, fontSize: 15, color: C.text }}>智能问答</Title>
+          {intent && (
+            <Tag style={{ background: 'rgba(245,78,0,0.14)', color: intentColor[intent], borderColor: 'rgba(245,78,0,0.4)', margin: 0 }}>
+              {intentLabels[intent]}
+            </Tag>
+          )}
+          {sessionId && (
+            <Tag style={{ background: 'transparent', borderColor: C.border, color: C.textSec, margin: 0 }}>会话 {sessionId}</Tag>
+          )}
         </Space>
       </Card>
 
-      {/* 数据看板 */}
-      {dashboard && (
-        <div style={{ padding: '12px 16px', background: '#fafafa', borderBottom: '1px solid #f0f0f0' }}>
-          <Row gutter={12}>
-            <Col span={6}>
-              <Card size="small">
-                <Statistic title="今日销售额" value={dashboard["今日销售额(元)"]}
-                  precision={2} prefix="¥" suffix="元" />
-              </Card>
-            </Col>
-            <Col span={6}>
-              <Card size="small">
-                <Statistic title="今日订单数" value={dashboard["今日订单数"]}
-                  prefix={<ShoppingCartOutlined />} suffix="单" />
-              </Card>
-            </Col>
-            <Col span={6}>
-              <Card size="small" style={dashboard["库存预警数"] > 0 ? { borderColor: '#ff4d4f' } : undefined}>
-                <Statistic title="库存预警" value={dashboard["库存预警数"]}
-                  prefix={<WarningOutlined style={{ color: dashboard["库存预警数"] > 0 ? '#ff4d4f' : '#52c41a' }} />}
-                  suffix="个商品"
-                  valueStyle={dashboard["库存预警数"] > 0 ? { color: '#ff4d4f' } : undefined} />
-              </Card>
-            </Col>
-            <Col span={6}>
-              <Card size="small">
-                <Statistic title="VIP 人均消费"
-                  value={dashboard["会员消费"]?.["vip"]?.["人均消费(元)"] ?? 0}
-                  precision={2} prefix="¥" suffix="元" />
-              </Card>
-            </Col>
-          </Row>
-          <Collapse ghost size="small" items={[{
-            key: 'detail', label: <Text type="secondary">📊 分类销售 & 会员对比</Text>,
-            children: (
-              <Row gutter={12}>
-                <Col span={12}>
-                  <Card size="small" title="分类销售额">
-                    {Object.entries(dashboard["分类销售"]).map(([cat, amt]) => (
-                      <div key={cat} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                        <Text>{cat}</Text>
-                        <Text strong>¥{amt.toLocaleString()}</Text>
-                      </div>
-                    ))}
-                  </Card>
-                </Col>
-                <Col span={12}>
-                  <Card size="small" title="会员消费对比">
-                    {Object.entries(dashboard["会员消费"]).map(([level, stats]) => (
-                      <div key={level} style={{ marginBottom: 8 }}>
-                        <Tag color={level === 'svip' ? 'gold' : level === 'vip' ? 'blue' : 'default'}>
-                          {level.toUpperCase()}
-                        </Tag>
-                        <Text type="secondary">总消费: ¥{stats["总消费(元)"].toLocaleString()} | </Text>
-                        <Text type="secondary">人均: ¥{stats["人均消费(元)"].toLocaleString()}</Text>
-                      </div>
-                    ))}
-                  </Card>
-                </Col>
-              </Row>
-            ),
-          }]} />
-        </div>
-      )}
-
-      {/* 消息列表 */}
-      <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: '16px 24px', background: '#f5f5f5' }}>
+      {/* ============ 消息列表 ============ */}
+      <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', background: C.bg }}>
         {messages.length === 0 && (
-          <div style={{ textAlign: 'center', marginTop: 60, color: '#999' }}>
-            <RobotOutlined style={{ fontSize: 48, marginBottom: 16 }} />
+          <div style={{ textAlign: 'center', marginTop: 64, color: C.textWeak }}>
+            <RobotOutlined style={{ fontSize: 44, marginBottom: 16, color: C.accent }} />
             <br />
-            <Text type="secondary">
-              我是你的电商运营助手<br />
-              📊 查询销售 ｜ 📦 库存预警 ｜ 👤 会员分析 ｜ ✍️ 内容生成
+            <Text style={{ color: C.textSec, fontSize: 15 }}>
+              我是你的电商运营助手
+            </Text>
+            <br />
+            <Text style={{ color: C.textWeak, fontSize: 13 }}>
+              查销售 ｜ 库存预警 ｜ 会员分析 ｜ 文案生成 ｜ 上传数据做竞品对比
             </Text>
           </div>
         )}
@@ -251,13 +272,15 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
           if (msg.role === 'plan') {
             return (
               <div key={i} style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
-                <Card size="small" style={{ width: '80%', background: '#f0f5ff' }}
+                <Card size="small" style={{ width: '82%', background: C.surface, borderColor: C.borderSoft, borderLeft: `3px solid ${C.accent}` }}
                   styles={{ body: { padding: '12px 16px' } }}>
-                  <Text strong>📋 执行计划</Text>
+                  <Text strong style={{ color: C.text, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <ProfileOutlined style={{ color: C.accent }} /> 执行计划
+                  </Text>
                   {msg.plan?.map((p, idx) => (
                     <div key={p.id} style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                      <Tag color="blue">{idx + 1}</Tag>
-                      <Text style={{ fontSize: 13 }}>{p.task}</Text>
+                      <Tag color="orange" style={{ margin: 0 }}>{idx + 1}</Tag>
+                      <Text style={{ fontSize: 13, color: C.textSec }}>{p.task}</Text>
                     </div>
                   ))}
                 </Card>
@@ -267,13 +290,15 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
           if (msg.role === 'subtask') {
             return (
               <div key={i} style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 8 }}>
-                <div style={{ maxWidth: '80%', width: '100%' }}>
+                <div style={{ maxWidth: '82%', width: '100%' }}>
                   <div style={{
-                    padding: '8px 14px', borderRadius: 10, background: '#f9f0ff',
-                    border: '1px solid #d3adf7', fontSize: 13, color: '#531dab',
+                    padding: '10px 14px', borderRadius: 10, background: C.surface2,
+                    border: `1px solid ${C.border}`, fontSize: 13, color: '#c8b9ff',
                     whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                   }}>
-                    <Text type="secondary" style={{ fontSize: 11 }}>🔧 子任务 {msg.subtaskId} 结果</Text>
+                    <Text style={{ fontSize: 11, color: C.textWeak, display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <ToolOutlined style={{ fontSize: 11 }} /> 子任务 {msg.subtaskId} 结果
+                    </Text>
                     <br />
                     {msg.content}
                   </div>
@@ -285,36 +310,65 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
             <div key={i} style={{
               display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 16,
             }}>
-              <div style={{ display: 'flex', maxWidth: '75%', gap: 8 }}>
-                {msg.role === 'assistant' && <RobotOutlined style={{ fontSize: 20, color: '#1677ff', marginTop: 8 }} />}
+              <div style={{ display: 'flex', maxWidth: '78%', gap: 8, alignItems: 'flex-start' }}>
+                {msg.role === 'assistant' && <RobotOutlined style={{ fontSize: 18, color: C.accent, marginTop: 10 }} />}
                 {msg.role === 'user' ? (
-                  // 用户消息：纯文本气泡
+                  // 用户消息：珊瑚橙底深字（PostHog 风格）
                   <div style={{
                     padding: '10px 16px', borderRadius: 12,
-                    background: '#1677ff', color: '#fff',
-                    whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.8,
+                    background: C.accent, color: C.accentText,
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.8, fontWeight: 500,
                   }}>
                     {msg.content}
                   </div>
                 ) : (
-                  // 助手消息：markdown 渲染（报告标题/加粗/列表）
+                  // 助手消息：深色表面 + 细边框，markdown 渲染
                   <div style={{
-                    padding: '10px 16px', borderRadius: 12,
-                    background: '#fff', color: '#333', wordBreak: 'break-word', lineHeight: 1.8,
-                    boxShadow: '0 1px 3px rgba(0,0,0,0.08)', flex: 1,
+                    padding: '12px 16px', borderRadius: 12,
+                    background: C.surface, color: C.text, wordBreak: 'break-word', lineHeight: 1.8,
+                    border: `1px solid ${C.borderSoft}`, flex: 1,
                   }}>
                     <ReactMarkdown components={mdComponents}>{msg.content}</ReactMarkdown>
                   </div>
                 )}
-                {msg.role === 'user' && <UserOutlined style={{ fontSize: 20, color: '#1677ff', marginTop: 8 }} />}
+                {msg.role === 'user' && <UserOutlined style={{ fontSize: 18, color: C.textSec, marginTop: 10 }} />}
               </div>
             </div>
           );
         })}
+
+        {/* 本次提问的执行时间线：意图→计划→子任务→报告 */}
+        {steps.length > 0 && <TracePanel steps={steps} />}
       </div>
 
-      {/* 底部输入区 */}
-      <Card size="small" style={{ borderRadius: 0, borderBottom: 0 }}>
+      {/* ============ 底部：上传区 + 输入区 ============ */}
+      <Card size="small" style={{ borderRadius: 0, borderBottom: 0, borderTop: `1px solid ${C.borderSoft}`, background: C.surface }}
+        styles={{ body: { padding: '10px 24px 12px' } }}>
+        {/* 上传数据条：CSV/PDF/MD，Agent 提问时注入做竞品对比 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
+          <Upload
+            accept=".csv,.tsv,.md,.pdf,.docx,.html,.htm"
+            showUploadList={false}
+            beforeUpload={(file) => { handleUpload(file as File); return false; }}
+          >
+            <Button size="small" icon={<UploadOutlined />} loading={uploading} style={{ fontWeight: 500 }}>
+              上传数据
+            </Button>
+          </Upload>
+          <Text style={{ fontSize: 12, color: C.textWeak }}>CSV / PDF / MD（≤10MB），供竞品对比分析</Text>
+          {uploaded.map(u => (
+            <Tag
+              key={u.filename}
+              icon={<FileTextOutlined />}
+              closable
+              onClose={() => setUploaded(prev => prev.filter(x => x !== u))}
+              style={{ background: 'rgba(255,225,77,0.1)', color: C.yellow, borderColor: 'rgba(255,225,77,0.35)', fontSize: 12 }}
+            >
+              {u.filename}
+            </Tag>
+          ))}
+        </div>
+
         <Space.Compact style={{ width: '100%' }}>
           <TextArea value={input} onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown} placeholder="输入问题，Enter 发送..."

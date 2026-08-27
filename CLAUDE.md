@@ -24,7 +24,7 @@
 
 ---
 
-## 当前完成状态（2025-08-05）
+## 当前完成状态（2026-08-28）
 
 ### 已完成 ✅
 
@@ -64,14 +64,22 @@
 
 **API 层：**
 - `POST /api/chat` — 普通回复
-- `POST /api/chat/stream` — SSE 流式（看到思考过程）
+- `POST /api/chat/stream` — SSE 流式（意图→计划→子任务→报告逐字）
 - `GET /api/dashboard` — 数据看板
-- sessions 目前是内存字典（`sessions: dict[str, list[Message]]`），重启丢失
+- `GET /api/dashboard/insight` — AI 经营洞察（数据快照喂 LLM 生成自然语言解读）
+- `POST /api/auth/*` — 注册/登录，JWT 鉴权
+- `POST /api/upload` — 文件上传解析（挂在会话下，供竞品对比）
+- `GET /api/sessions` + `GET/PATCH/DELETE /api/sessions/{sid}` — 多会话列表/历史/重命名/删除
+- 会话已持久化：`chat_messages`（消息）+ `chat_sessions`（会话元信息）两张表
 
 **前端：**
-- React + TypeScript + Ant Design
-- ChatPage.tsx: 聊天界面 + 数据看板卡片
-- api.ts: sendMessageStream() SSE 流式读取，done 事件正确处理
+- React + TypeScript + Ant Design + @ant-design/plots（看板图表）
+- App.tsx: 功能侧边栏（智能问答/数据看板）+ 会话状态管理（chatKey 重挂载切换会话）
+- SessionSidebar.tsx: 多会话列表（新建/切换/删除）
+- ChatPage.tsx: 聊天界面（历史加载、SSE 流式、上传对比；SSE 事件 → 执行时间线状态机）
+- TracePanel.tsx: 执行时间线（意图→计划→子任务→报告 live 化：状态动效 + 耗时 + 工具提示）
+- DashboardPage.tsx: 数据看板（统计卡 + 图表 + AI 经营洞察卡片）
+- api.ts: SSE 流式读取 + 会话 CRUD + 洞察接口封装
 
 **脚本：**
 - `scripts/init_db.py` — 建表
@@ -82,12 +90,10 @@
 
 ### 尚未完成 ❌
 
-- 用户登录 + JWT 认证
-- sessions 持久化（替换内存字典 → SQLite/Redis）
-- Cross-Encoder 重排序（retriever.py 中已预留）
-- 个性化记忆（用户画像注入查询）
-- Docker Compose 部署
-- 前端近 7 日销售趋势折线图
+- Docker Compose 部署（后端/前端/数据库一键起）
+- Alembic 迁移（开发期 init_db 直接 drop_all 够用，上线前换迁移）
+- 会话彻底删除（目前是软删除，消息仍留库）
+- 前端会话重命名入口（后端 PATCH API 已有，侧边栏未接 UI）
 
 ---
 
@@ -115,7 +121,7 @@ ecommerce-agent/
 │   │   ├── llm/                    # LLM 接口（base/qwen/factory）
 │   │   ├── tool/                   # 工具系统（base/registry）
 │   │   ├── agent/                  # AgentGraph 状态图引擎
-│   │   ├── memory/                 # 会话记忆（空壳待填）
+│   │   ├── memory/                 # 记忆系统（消息/会话/画像 + 用户画像提炼）
 │   │   └── config.py               # 全局配置（.env → Pydantic）
 │   │
 │   ├── agents/                     # Agent 实现
@@ -132,11 +138,14 @@ ecommerce-agent/
 │   ├── api/                        # FastAPI
 │   │   ├── app.py                  # 应用入口 + CORS
 │   │   ├── routes/chat.py          # /api/chat + /api/chat/stream
-│   │   ├── routes/dashboard.py     # /api/dashboard
+│   │   ├── routes/auth.py          # 注册/登录（JWT）
+│   │   ├── routes/dashboard.py     # /api/dashboard + /api/dashboard/insight
+│   │   ├── routes/upload.py        # /api/upload 文件解析
+│   │   ├── routes/session.py       # /api/sessions 多会话 CRUD
 │   │   └── schemas/chat.py         # Pydantic 模型
 │   │
 │   ├── db/                         # 数据库
-│   │   ├── models/                 # Product / Order / User
+│   │   ├── models/                 # Product/Order/User/ChatMessage/ChatSession/UserProfile/UploadedDoc
 │   │   ├── session.py              # 异步引擎 + sessionmaker
 │   │   └── migrations/             # Alembic（空壳）
 │   │
@@ -156,9 +165,13 @@ ecommerce-agent/
 │
 ├── frontend/
 │   └── src/
-│       ├── ChatPage.tsx            # 聊天界面 + 数据看板
-│       ├── api.ts                  # API 封装（含 SSE 流式）
-│       └── App.tsx                 # 应用入口
+│       ├── App.tsx                 # 应用入口 + 会话状态管理
+│       ├── ChatPage.tsx            # 聊天界面（SSE → 时间线状态机）
+│       ├── SessionSidebar.tsx      # 多会话列表
+│       ├── TracePanel.tsx          # 执行时间线
+│       ├── DashboardPage.tsx       # 数据看板 + AI 洞察
+│       ├── LoginPage.tsx           # 登录
+│       └── api.ts                  # API 封装（SSE/会话/洞察）
 │
 ├── scripts/
 │   ├── init_db.py                  # 建表
@@ -195,6 +208,18 @@ ecommerce-agent/
 
 ### 6. SQLite 异步驱动
 用 aiosqlite 而不是标准 sqlite3，因为 FastAPI 是全异步的，同步操作会阻塞其他请求。
+
+### 7. 两段式检索（粗排 + 精排）
+RRF 融合 BM25+向量是"粗排"（快而糙，只比排名位置），再用 CrossEncoder（gte-rerank-v2）对 top-10 语义精排（慢而准）。精排增益通常比加大召回更明显，是 RAG 检索质量的常规兜底。
+
+### 8. 会话元信息与消息分离（多会话）
+`chat_messages` 只管消息，`chat_sessions` 管会话本身（标题/最近活跃/软删除）。侧边栏列表只查小表，不扫消息表；软删除留恢复口子。
+
+### 9. Agent 过程可观测（live 时间线）
+Agent 最大的缺点是黑盒。后端 SSE 事件（intent/plan/subtask/token/report）驱动前端执行时间线：进行中转圈、完成打勾 + 耗时、失败标红，子任务带工具提示和结果摘要。让运营看到"它真在干活"，增强信任，也是差异化。
+
+### 10. 看板会说话（AI 经营洞察）
+看板只有当前值、没有判断依据（涨跌不知道、风险看不出）。洞察接口把比看板更全的快照（今日/昨日/上周对比、库存明细、Top 商品）喂给 LLM 生成自然语言解读。复用分析 Agent 的能力，让"数据陈列"变"经营解读"。
 
 ---
 

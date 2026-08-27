@@ -8,6 +8,7 @@ from backend.api.routes.chat import router as chat_router
 from backend.api.routes.dashboard import router as dashboard_router
 from backend.api.routes.auth import router as auth_router
 from backend.api.routes.upload import router as upload_router
+from backend.api.routes.session import router as session_router
 from backend.api.middleware import RequestLogMiddleware, ExceptionHandlerMiddleware
 
 # 配置日志
@@ -39,6 +40,7 @@ app.include_router(chat_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(upload_router, prefix="/api")
+app.include_router(session_router, prefix="/api")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -11,10 +11,8 @@ class ProfileExtractor:
 
     async def extract(self, conversation: str, old_profile: str = "") -> list[str]:
         system_prompt = f"""你是用户画像分析师。根据用户（电商运营人员）的历史对话，提炼这个运营人员的画像，拆成多条短记忆句子。
-
                 已有画像（要和本次对话合并，不要丢弃仍然成立的部分）：
                 {old_profile or "（暂无）"}
-
                 任务：合并【已有画像】与【本次对话的新信息】，输出这个用户当前最完整的画像。
                 每条记忆的规则：
                 - 一条一句话、独立成立，去掉"该运营人员""用户"等主语前缀，能直接当语义检索条目

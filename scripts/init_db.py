@@ -8,6 +8,7 @@ from backend.db.models.product import Product  # 触发注册
 from backend.db.models.order import Order  # 触发注册
 from backend.db.models.user import User  # 触发注册
 from backend.db.models.chat_message import ChatMessage  # 触发注册（会话历史持久化）
+from backend.db.models.chat_session import ChatSession  # 触发注册（会话元信息：多会话列表/重命名/删除）
 from backend.db.models.user_profile import UserProfile
 async def init_db():
     # 用引擎创建连接
