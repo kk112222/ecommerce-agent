@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from backend.core.llm.base import Message
 from backend.db.models.chat_message import ChatMessage
@@ -32,7 +33,10 @@ async def load_messages(sid: str, user_id: int) -> list[Message]:
             ).order_by(ChatMessage.id)
         )).scalars().all()
         return [Message(role=r.role, content=r.content) for r in rows]
-async def get_messages(sid: str, user_id: int,limit:int=10) -> str:
+# 历史注入的上下文预算（字）：超过就从最旧的整条消息丢起，保住最近几轮完整对话
+MAX_HISTORY_CHARS = 8000
+
+async def get_messages(sid: str, user_id: int, limit: int = 10) -> str:
     history = await load_messages(sid, user_id)
     if not history:
         return ""
@@ -41,7 +45,12 @@ async def get_messages(sid: str, user_id: int,limit:int=10) -> str:
     for msg in recent:
         who = "用户" if msg.role == "user" else "助手"
         lines.append(f"{who}: {msg.content}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # 超预算按整条丢（不砍半条），宁可少带几轮也别截断消息内容
+    while len(text) > MAX_HISTORY_CHARS and len(lines) > 1:
+        lines.pop(0)
+        text = "\n".join(lines)
+    return text
 async def get_user_profile(user_id:int) -> str:
     #获取用户偏好
     async with AsyncSessionLocal() as db:
@@ -74,8 +83,11 @@ async def save_user_memories(user_id: int, sentences: list[str]) -> None:
     ensure_collection(MEMORY_COLLECTION)
     delete_by_user(MEMORY_COLLECTION, user_id)   # 旧记忆作废
     vectors = await embed_batch(sentences)
+    # created_at：每条记忆打时间戳，为将来增量式积累（append 不覆盖、召回按新鲜度加权）预留字段
+    ts = datetime.now().isoformat(timespec="seconds")
     points = [
-        {"id": str(uuid.uuid4()), "vector": v, "payload": {"text": s, "user_id": user_id}}
+        {"id": str(uuid.uuid4()), "vector": v,
+         "payload": {"text": s, "user_id": user_id, "created_at": ts}}
         for s, v in zip(sentences, vectors) if v
     ]
     if points:
@@ -100,8 +112,15 @@ async def save_uploaded_doc(session_id: str, user_id: int, filename: str, conten
         await db.commit()
 
 
+# 单个上传文件最多注入 Agent 的字符数（20 页 PDF 解析几万字，全量塞 prompt 会撑爆上下文）
+MAX_DOC_CHARS = 6000
+
 async def get_uploaded_docs(session_id: str, user_id: int) -> str:
-    """读该会话上传过的文件解析文本，拼成字符串（聊天时注入 Agent，供对比分析）"""
+    """读该会话上传过的文件解析文本，拼成字符串（聊天时注入 Agent，供对比分析）
+
+    超长文件在注入层截断到 MAX_DOC_CHARS（DB 仍存完整解析文本），
+    避免上传大文件把上下文撑爆
+    """
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(
             select(UploadedDoc).where(
@@ -111,7 +130,14 @@ async def get_uploaded_docs(session_id: str, user_id: int) -> str:
         )).scalars().all()
     if not rows:
         return ""
-    return "\n\n".join(f"【上传文件：{r.filename}】\n{r.content}" for r in rows)
+    parts = []
+    for r in rows:
+        content = r.content
+        if len(content) > MAX_DOC_CHARS:
+            content = content[:MAX_DOC_CHARS] + \
+                f"\n…[原文共 {len(r.content)} 字，超长截断，仅保留前 {MAX_DOC_CHARS} 字]"
+        parts.append(f"【上传文件：{r.filename}】\n{content}")
+    return "\n\n".join(parts)
 
 
 # ============ 会话元信息（多会话支持）============
