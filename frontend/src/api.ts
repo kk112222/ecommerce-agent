@@ -84,7 +84,8 @@ export type StreamEvent =
   | { type: "subtask"; id: string; task: string; result: string }
   | { type: "token"; content: string }   // 报告逐字片段（打字机效果）
   | { type: "report"; report: string }
-  | { type: "session"; session_id: string };
+  | { type: "session"; session_id: string }
+  | { type: "error"; message: string };   // Agent/LLM 链路失败（后端兜底事件，用于结束 loading）
 
 /**
  * 流式聊天 —— SSE 推送思考过程 + token

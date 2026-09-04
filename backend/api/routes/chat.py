@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 from fastapi import Depends
 from backend.db.models.user import User
@@ -14,6 +15,8 @@ import asyncio
 from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories, get_uploaded_docs, upsert_session
 from backend.core.memory.extractor import ProfileExtractor
 router = APIRouter()
+
+logger = logging.getLogger("ecommerce-agent")   # 与中间件同 logger，日志格式统一
 
 
 
@@ -61,15 +64,21 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
         queue: asyncio.Queue = asyncio.Queue()
 
         async def run_graph():                 # 后台任务：跑整个多 Agent 图
-            graph = build_supervisor(llm, registry, on_event=lambda evt: queue.put(evt))
-            final = await graph.invoke({"goal": goal, "history": history_text,
-                                        "user_profile": profile, "uploaded_data": uploaded_data})
-            # 图跑完，把完整报告落库（user 消息在请求进来时已存）
-            report = final.get("report", "")
-            if report:
-                await save_message(sid, current_user.id, "assistant", report)
-            asyncio.create_task(_extract_and_save(current_user.id, goal))
-            await queue.put(None)              # 结束信号
+            try:
+                graph = build_supervisor(llm, registry, on_event=lambda evt: queue.put(evt))
+                final = await graph.invoke({"goal": goal, "history": history_text,
+                                            "user_profile": profile, "uploaded_data": uploaded_data})
+                # 图跑完，把完整报告落库（user 消息在请求进来时已存）
+                report = final.get("report", "")
+                if report:
+                    await save_message(sid, current_user.id, "assistant", report)
+                asyncio.create_task(_extract_and_save(current_user.id, goal))
+            except Exception as e:
+                # Agent/LLM 链路失败也必须把结束信号送出去（finally），否则 SSE 永远挂起、前端无限转圈
+                logger.exception("Agent 链路异常")
+                queue.put_nowait({"type": "error", "message": f"分析失败：{e}"})
+            finally:
+                await queue.put(None)          # 结束信号：无论成败必达
 
         task = asyncio.create_task(run_graph())
 

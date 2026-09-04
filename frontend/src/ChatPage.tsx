@@ -12,6 +12,7 @@ import {
 } from './api';
 import TracePanel, { type TraceStep } from './TracePanel';
 import ReactMarkdown from 'react-markdown';
+import VizBlock, { parseViz } from './VizBlock';
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
@@ -60,6 +61,18 @@ const mdComponents = {
   a: ({ node: _n, ...props }: any) => <a style={{ color: '#ff7a3d' }} {...props} />,
   strong: ({ node: _n, ...props }: any) => <strong style={{ color: C.text }} {...props} />,
 };
+
+/** 助手消息渲染：普通 markdown + 识别末尾 ```viz 块渲染成图表/表格。
+ * 流式中块没闭合 → 正文照常打字机，图表区显示占位；report 完整后自动替换成真图 */
+function MarkdownViz({ content }: { content: string }) {
+  const { body, viz, incomplete } = parseViz(content);
+  return (
+    <>
+      <ReactMarkdown components={mdComponents}>{body}</ReactMarkdown>
+      {viz !== null && <VizBlock raw={viz} incomplete={incomplete} />}
+    </>
+  );
+}
 
 interface ChatMsg {
   role: 'user' | 'assistant' | 'plan' | 'subtask';
@@ -188,6 +201,12 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
           case 'report':
             appendAssistant(event.report, true);
             finishStep('report', {});
+            setLoading(false);
+            break;
+          case 'error':
+            // 后端链路异常（LLM 失败等）：标红 + 报错 + 结束 loading，别让界面永久转圈
+            setSteps(prev => prev.map(s => s.status === 'running' ? { ...s, status: 'error' } : s));
+            message.error(event.message || '分析失败');
             setLoading(false);
             break;
           case 'session':
@@ -328,7 +347,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
                     background: C.surface, color: C.text, wordBreak: 'break-word', lineHeight: 1.8,
                     border: `1px solid ${C.borderSoft}`, flex: 1,
                   }}>
-                    <ReactMarkdown components={mdComponents}>{msg.content}</ReactMarkdown>
+                    <MarkdownViz content={msg.content} />
                   </div>
                 )}
                 {msg.role === 'user' && <UserOutlined style={{ fontSize: 18, color: C.textSec, marginTop: 10 }} />}
