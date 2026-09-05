@@ -24,7 +24,7 @@
 
 ---
 
-## 当前完成状态（2026-08-28）
+## 当前完成状态（2026-09-04）
 
 ### 已完成 ✅
 
@@ -88,12 +88,20 @@
 - `scripts/build_kb.py` — 知识库构建（自动识别格式→切块→embedding→入库）
 - `scripts/test_agent.py` / `test_agent_llm.py` / `test_llm.py` — 测试脚本
 
+### 增补（08-28 → 09-04）
+
+- **会话重命名 + 彻底删除 ✅（08-28，0a1aa18）**：SessionSidebar 编辑态（hover/双击进 Input，Enter 提交）＋删除二次确认；后端 delete 从软删升物理删除（`delete(ChatMessage/ChatSession)`）。后续修 `d5ba43c`：物理删除连带清 uploaded_doc
+- **AI 洞察生成提速 ✅（08-28，0e720ec）**：当天缓存秒开（insight_cache 表，startup 幂等 create_all 补表）+ `?refresh=true` 强制重生成；LLM 失败不写缓存
+- **上下文/上传注入超长保护 + 记忆打时间戳 ✅（09-04，ada22eb）**：`get_messages` 历史 MAX_HISTORY_CHARS=8000 从最旧逐条丢；上传文档注入 MAX_DOC_CHARS=6000 截断并标注原文总字数；`save_user_memories` payload 带 created_at（scripts/verify_context_fix.py）
+- **聊天输出自适应可视化 ✅（09-04，0677a8c）**：Synthesizer prompt 末尾注入 `VIZ_RULES`——结论适合图/表时在报告最末尾追加且仅一个 ```` ```viz ```` JSON 块（type 限 line/bar/column/table，数值必须逐字照抄子任务结果、禁止编造）。纯文本协议→零 schema 改动、历史重放免费。前端 `VizBlock.tsx`（parseViz 抽块 + Area/Column/Bar/Table 渲染）三层容错：块未闭合占位 Spin / JSON 坏或未知 type 弱提示不崩
+- **SSE 链路异常兜底 ✅（09-04，0677a8c）**：run_graph try/except/finally——失败也推 error 事件 + **finally 必送 None 哨兵**，否则 LLM 挂了 SSE 永久挂起、前端无限 loading；前端 switch 加 error case（标红 + message.error + 结束 loading）
+- **模型切换 ✅**：当前对话模型 qwen3.8-27b（改 .env `LLM_MODEL`，改完重启后端生效）。坑：DashScope 对话模型免费额度独立于 embedding/rerank（403 只挂聊天、RAG 正常）
+
 ### 尚未完成 ❌
 
 - Docker Compose 部署（后端/前端/数据库一键起）
 - Alembic 迁移（开发期 init_db 直接 drop_all 够用，上线前换迁移）
-- 会话彻底删除（目前是软删除，消息仍留库）
-- 前端会话重命名入口（后端 PATCH API 已有，侧边栏未接 UI）
+- 上线前优化：LLM 供应商切换配置化（BASE_URL 仍硬编码 DashScope）、前端 bundle code splitting（当前 2.3MB）
 
 ---
 
