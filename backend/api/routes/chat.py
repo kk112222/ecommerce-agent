@@ -12,8 +12,25 @@ from backend.core.llm.factory import create_llm
 from backend.core.tool.registry import ToolRegistry
 from backend.tools import register_all_tools
 import asyncio
-from backend.core.memory.store import save_message, get_messages, get_user_profile, update_user_profile, save_user_memories, recall_user_memories, get_uploaded_docs, upsert_session
+from backend.core.memory.store import (
+    save_message, get_messages, recall_user_memories, get_uploaded_docs, upsert_session,
+    merge_semantic_memories, save_episodic_memories, semantic_snapshot,
+)
 from backend.core.memory.extractor import ProfileExtractor
+
+# per-user 提炼写锁：同一用户的 /chat 与 /chat/stream 可能并发触发提炼，
+# 记忆是"读旧→merge 写"的读改写，不加锁会互相覆盖丢记忆（外部评审 M3 真 bug）
+_EXTRACT_LOCKS: dict[int, asyncio.Lock] = {}
+_EXTRACT_GUARD = asyncio.Lock()
+
+
+async def _user_extract_lock(user_id: int) -> asyncio.Lock:
+    async with _EXTRACT_GUARD:
+        lock = _EXTRACT_LOCKS.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _EXTRACT_LOCKS[user_id] = lock
+        return lock
 router = APIRouter()
 
 logger = logging.getLogger("ecommerce-agent")   # 与中间件同 logger，日志格式统一
@@ -38,7 +55,7 @@ async def chat(request: ChatRequest, current_user: User = Depends(get_current_us
                                 "user_profile": profile, "uploaded_data": uploaded_data})
     result = final["report"]
     await save_message(sid, current_user.id, "assistant", result)
-    asyncio.create_task(_extract_and_save(current_user.id, request.message))
+    asyncio.create_task(_extract_and_save(current_user.id, sid, request.message, result))
     return ChatResponse(reply=result, session_id=sid)
 
 
@@ -72,7 +89,7 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
                 report = final.get("report", "")
                 if report:
                     await save_message(sid, current_user.id, "assistant", report)
-                asyncio.create_task(_extract_and_save(current_user.id, goal))
+                asyncio.create_task(_extract_and_save(current_user.id, sid, goal, report))
             except Exception as e:
                 # Agent/LLM 链路失败也必须把结束信号送出去（finally），否则 SSE 永远挂起、前端无限转圈
                 logger.exception("Agent 链路异常")
@@ -100,18 +117,36 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
     )
 
 
-async def _extract_and_save(user_id: int, goal: str) -> None:
-    """后台提炼记忆并更新 —— 不阻塞回复，失败静默
-    读-合并-写：先读旧画像当合并底子，LLM 把「旧画像+本轮对话」合并成全量画像，再覆盖写
-    （否则每轮只提炼本轮内容，会把之前的画像冲掉，长期记忆不累积）"""
+# 太琐碎的寒暄不触发提炼（省成本：外部评审 M2 的轻量版，完整版是"攒 N 轮再提炼"）
+_TRIVIAL_GOALS = {"谢谢", "好的", "嗯", "好", "ok", "OK", "知道了", "好的好的"}
+
+
+async def _extract_and_save(user_id: int, sid: str, goal: str, reply: str) -> None:
+    """后台提炼记忆并写入 —— 不阻塞回复，失败只记日志
+
+    改造点（对照外部评审）：
+    - 原料是【整轮】用户问 + 助手答（M1）：画像信号藏在"答完用户认不认可/追不追问"里，
+      只看孤立问题会把稳定偏好漏掉；
+    - 一次 LLM 调用拆 semantic（稳定画像，合并旧全量）+ episodic（情景记忆，append），
+      分别走增量写路径（M4/M5），不再删光重建；
+    - per-user 锁串行化"读-改-写"（M3 并发丢记忆真 bug）。
+    """
+    goal_s = (goal or "").strip()
+    if len(goal_s) < 4 or goal_s in _TRIVIAL_GOALS:
+        return
     try:
         llm = create_llm()
-        extractor = ProfileExtractor(llm)
-        old_profile = await get_user_profile(user_id)              # ① 读旧画像（合并的底子）
-        sentences = await extractor.extract(f"用户：{goal}", old_profile=old_profile)  # ② 合并提炼
-        if sentences:                         # 提炼出内容才更新，空列表不覆盖旧记忆
-            await save_user_memories(user_id, sentences)                # ③ 覆盖写全量：多条记忆向量化
-            await update_user_profile(user_id, "；".join(sentences))    # 兜底：一句话画像表同步
+        async with _user_extract_lock(user_id):
+            extractor = ProfileExtractor(llm)
+            old_profile = await semantic_snapshot(user_id)          # ① 语义画像合并底子
+            # ② 整轮对话当原料（报告可能很长，截前 1600 字省 token）
+            conversation = f"用户：{goal_s}\n助手：{(reply or '')[:1600]}"
+            out = await extractor.extract(conversation, old_profile=old_profile)
+            # ③ 写路径：语义增量合并 + 情景 append（两类各自幂等，可安全串行执行）
+            if out.get("semantic"):
+                await merge_semantic_memories(user_id, out["semantic"], source_session=sid)
+            if out.get("episodic"):
+                await save_episodic_memories(user_id, out["episodic"], source_session=sid)
     except Exception:
-        pass                                  # 记忆提炼失败不影响主流程
+        logger.exception("记忆提炼失败")        # 记忆失败不影响主流程
 

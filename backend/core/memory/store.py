@@ -1,17 +1,20 @@
+import difflib
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from backend.core.llm.base import Message
 from backend.db.models.chat_message import ChatMessage
 from backend.db.models.chat_session import ChatSession
 from backend.db.models.user_profile import UserProfile
 from backend.db.models.uploaded_doc import UploadedDoc
+from backend.db.models.user_memory import LongTermMemory
 from backend.db.session import AsyncSessionLocal
 from backend.infrastructure.vector_store.embeddings import embed_text, embed_batch
 from backend.infrastructure.vector_store.qdrant_client import (
-    ensure_collection, upsert_docs, search_similar, delete_by_user,
+    ensure_collection, upsert_docs, search_similar, delete_points,
 )
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, update
 
 MEMORY_COLLECTION = "user_memories"  # 用户记忆的 qdrant collection（和知识库 kb_docs 分开）
 
@@ -76,32 +79,292 @@ async def update_user_profile(user_id:int,preferences:str) -> None:
         await db.commit()
 
 
-async def save_user_memories(user_id: int, sentences: list[str]) -> None:
-    """把提炼出的记忆句子向量化存进 qdrant（覆盖式：先清该用户旧的再插新的，避免重复积累）"""
-    if not sentences:
-        return
+# ==================== 长期记忆：语义画像 + 情景记忆（增量式） ====================
+# 外部评审改造核心（对旧"删光重建"）：
+# - 写路径不再 delete_by_user 整组清空 → merge 增量对齐：同义刷新 / 变化作废重写 / 全新 append
+# - 每条落 SQLite 一行（long_term_memories，事实源），qdrant 只当向量召回索引 → 能逐条删/管理
+# - 补齐情景记忆层（episodic），和语义画像同表 kind 区分；读取按 相似×重要×新鲜度 加权
+
+KIND_SEMANTIC = "semantic"    # 稳定画像：负责类目/关注 KPI/偏好
+KIND_EPISODIC = "episodic"    # 情景记忆：发生过的事/带时间的事实/新动向（可过期）
+
+
+def _norm(s: str) -> str:
+    """归一化：去空白 + 小写，让相似度比较不被空格/大小写干扰"""
+    return re.sub(r"\s+", "", s or "").lower()
+
+
+def _utcnow() -> datetime:
+    """naive UTC 当前时间 —— 与 SQLite func.now()(UTC) 同口径，避免用将被弃用的 datetime.utcnow"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _ratio(a: str, b: str) -> float:
+    """中文字面相似度（difflib 标准库，不引包）。1=完全一致，0=毫不相关"""
+    a, b = _norm(a), _norm(b)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+async def _embed_chunked(texts: list[str], size: int = 8) -> list[list[float]]:
+    """批量向量化（DashScope 单批 ≤10，本地再压到 8 保险）"""
+    out: list[list[float]] = []
+    for i in range(0, len(texts), size):
+        out.extend(await embed_batch(texts[i:i + size]))
+    return out
+
+
+async def _active_rows(user_id: int, kind: str | None = None) -> list[LongTermMemory]:
+    """该用户生效中的长期记忆行（可只看某一类）；expires 已过的当失效，不返回"""
+    now = _utcnow()
+    async with AsyncSessionLocal() as db:
+        q = select(LongTermMemory).where(
+            LongTermMemory.user_id == user_id,
+            LongTermMemory.active.is_(True),
+            (LongTermMemory.expires_at.is_(None)) | (LongTermMemory.expires_at > now),
+        )
+        if kind:
+            q = q.where(LongTermMemory.kind == kind)
+        return list((await db.execute(q.order_by(LongTermMemory.id))).scalars().all())
+
+
+async def semantic_snapshot(user_id: int) -> str:
+    """当前语义画像快照（合并提炼的底子 / 兜底）—— 生效中的 semantic 行编号拼串"""
+    rows = await _active_rows(user_id, KIND_SEMANTIC)
+    if not rows:
+        return await get_user_profile(user_id)   # 空时退一句话画像表
+    return "\n".join(f"{i + 1}. {r.text}" for i, r in enumerate(rows))
+
+
+async def _sync_profile_fallback(user_id: int) -> None:
+    """同步一句话画像表（兜底用）：由生效中的 semantic 行重算，保证两处一致"""
+    rows = await _active_rows(user_id, KIND_SEMANTIC)
+    await update_user_profile(user_id, "；".join(r.text for r in rows))
+
+
+async def merge_semantic_memories(user_id: int, new_sentences: list[str],
+                                  source_session: str | None = None) -> dict:
+    """增量合并语义画像（核心写路径，取代"删光重建"）
+
+    把 LLM 输出的【当前全量画像】和库里生效中的旧画像逐条比对：
+    - 相似度 ≥ 0.9   同一条偏好 → 只刷新热度（importance+1 / last_access）
+    - 0.45 ~ 0.9    同一偏好的"变化版"（如负责类目男装→女装）→ 作废旧行、按新文本重写
+    - < 0.45        全新偏好 → append
+    - 旧行没被任何新句认领 = LLM 判定不再成立 → 作废（active=False，删其向量，保留行可审计）
+    """
+    clean = [s.strip() for s in (new_sentences or []) if s and s.strip()]
+    if not clean:
+        return {"added": 0, "changed": 0, "kept": 0, "retired": 0}
     ensure_collection(MEMORY_COLLECTION)
-    delete_by_user(MEMORY_COLLECTION, user_id)   # 旧记忆作废
-    vectors = await embed_batch(sentences)
-    # created_at：每条记忆打时间戳，为将来增量式积累（append 不覆盖、召回按新鲜度加权）预留字段
-    ts = datetime.now().isoformat(timespec="seconds")
-    points = [
-        {"id": str(uuid.uuid4()), "vector": v,
-         "payload": {"text": s, "user_id": user_id, "created_at": ts}}
-        for s, v in zip(sentences, vectors) if v
-    ]
-    if points:
-        upsert_docs(points, collection_name=MEMORY_COLLECTION)
+
+    old = await _active_rows(user_id, KIND_SEMANTIC)
+    used = [False] * len(old)          # 每条旧行最多被认领一次
+    keep_ids, retire = [], []          # 刷新 / 作废（含被"变化版"替换的）
+    add_texts: list[str] = []
+    n_new = n_changed = 0
+
+    for s in clean:
+        best_i, best_r = -1, 0.0
+        for i, row in enumerate(old):
+            if used[i]:
+                continue
+            r = _ratio(s, row.text)
+            if r > best_r:
+                best_i, best_r = i, r
+        if best_i >= 0 and best_r >= 0.90:
+            used[best_i] = True
+            keep_ids.append(old[best_i].id)
+        elif best_i >= 0 and best_r >= 0.45:     # 同一偏好变了：作废旧版本，当新条目重写
+            used[best_i] = True
+            retire.append(old[best_i])
+            add_texts.append(s)
+            n_changed += 1
+        else:
+            add_texts.append(s)
+            n_new += 1
+    for i, row in enumerate(old):                # 没被认领 = 判定不再成立 → 作废
+        if not used[i]:
+            retire.append(row)
+
+    # ① 新文本向量化（API 失败留空 → 该行 qdrant_point_id=None，仍保留文本、可走画像兜底）
+    vecs = await _embed_chunked(add_texts)
+    payload_ts = datetime.now().isoformat(timespec="seconds")
+    now = _utcnow()
+    new_points = []                              # (text, point_id or None)
+    for text, v in zip(add_texts, vecs):
+        if not v:
+            new_points.append((text, None))
+        else:
+            new_points.append((text, str(uuid.uuid4())))
+
+    # ② qdrant：删作废向量 + 插新向量（payload 带 kind/created_at 便于排查）
+    del_ids = [r.qdrant_point_id for r in retire if r.qdrant_point_id]
+    if del_ids:
+        delete_points(MEMORY_COLLECTION, del_ids)
+    docs = [{"id": pid, "vector": vecs[i],
+             "payload": {"text": text, "user_id": user_id, "created_at": payload_ts,
+                         "kind": KIND_SEMANTIC}}
+            for i, (text, pid) in enumerate(new_points) if pid]
+    if docs:
+        upsert_docs(docs, collection_name=MEMORY_COLLECTION)
+
+    # ③ SQLite：刷新命中条 / 作废 retire / 插新行（一次事务）
+    # 注意 retire 行是上个 session 读出的脱管对象，直接改属性不落库 → 用 id 批量 UPDATE
+    retire_ids = [r.id for r in retire]
+    async with AsyncSessionLocal() as db:
+        for kid in keep_ids:
+            row = await db.get(LongTermMemory, kid)
+            if row:
+                row.importance = min(10, (row.importance or 1) + 1)
+                row.last_access_at = now
+        if retire_ids:
+            await db.execute(
+                update(LongTermMemory)
+                .where(LongTermMemory.id.in_(retire_ids))
+                .values(active=False))
+        for text, pid in new_points:
+            db.add(LongTermMemory(user_id=user_id, kind=KIND_SEMANTIC, text=text,
+                                  qdrant_point_id=pid, source_session=source_session,
+                                  created_at=now))
+        await db.commit()
+
+    await _sync_profile_fallback(user_id)        # 兜底画像表跟随
+    return {"added": n_new, "changed": n_changed, "kept": len(keep_ids), "retired": len(retire)}
+
+
+async def save_user_memories(user_id: int, sentences: list[str]) -> None:
+    """兼容旧调用（历史验证脚本）：等同于"全量对齐语义画像"，已是增量 merge 而非删光重建"""
+    await merge_semantic_memories(user_id, sentences)
+
+
+async def save_episodic_memories(user_id: int, events: list[str],
+                                 source_session: str | None = None) -> int:
+    """情景记忆 append：和已有情景条相似的（≥0.85）去重跳过，否则落新行 + 向量"""
+    clean = [e.strip() for e in (events or []) if e and e.strip()]
+    if not clean:
+        return 0
+    ensure_collection(MEMORY_COLLECTION)
+
+    old = await _active_rows(user_id, KIND_EPISODIC)
+    to_add = []
+    for e in clean:
+        dup = any(_ratio(e, row.text) >= 0.85 for row in old)
+        if not dup:
+            to_add.append(e)
+    if not to_add:
+        return 0
+
+    vecs = await _embed_chunked(to_add)
+    payload_ts = datetime.now().isoformat(timespec="seconds")
+    now = _utcnow()
+    docs, rows = [], []
+    for text, v in zip(to_add, vecs):
+        pid = str(uuid.uuid4()) if v else None
+        rows.append((text, pid))
+        if v:
+            docs.append({"id": pid, "vector": v,
+                         "payload": {"text": text, "user_id": user_id,
+                                     "created_at": payload_ts, "kind": KIND_EPISODIC}})
+    if docs:
+        upsert_docs(docs, collection_name=MEMORY_COLLECTION)
+    async with AsyncSessionLocal() as db:
+        for text, pid in rows:
+            db.add(LongTermMemory(user_id=user_id, kind=KIND_EPISODIC, text=text,
+                                  qdrant_point_id=pid, source_session=source_session,
+                                  created_at=now))
+        await db.commit()
+    return len(rows)
 
 
 async def recall_user_memories(user_id: int, query: str, top_k: int = 3) -> str:
-    """按当前问题语义召回该用户最相关的记忆，拼成文本；召回为空则回退一句话画像表（兜底）"""
+    """按问题召回长期记忆（语义+情景一起），加权 = 相似度 × 重要性 × 新鲜度
+
+    语义与情景都向量化进了同一 collection，向量召回天然能"语义命中"两类的文本；
+    命中不足时补最近几条（承接"刚才/上次说的"这类指代）；全空才退一句话画像兜底。
+    """
+    rows = await _active_rows(user_id)
+    if not rows:
+        return await get_user_profile(user_id)
+    now = _utcnow()
+    picked: list[LongTermMemory] = []
+
     vector = await embed_text(query)
-    hits = search_similar(vector, top_k=top_k, collection_name=MEMORY_COLLECTION,
-                          user_id=user_id) if vector else []
-    if hits:
-        return "\n".join(h["text"] for h in hits)
-    return await get_user_profile(user_id)   # 兜底：向量库还没有记忆时用一句话画像
+    if vector:
+        hits = search_similar(vector, top_k=max(top_k * 4, 12),
+                              collection_name=MEMORY_COLLECTION, user_id=user_id)
+        pid2row = {r.qdrant_point_id: r for r in rows if r.qdrant_point_id}
+        scored = []
+        for h in hits:
+            row = pid2row.get(h["id"])
+            if not row:
+                continue
+            age_days = max(0.0, (now - (row.created_at or now)).total_seconds() / 86400.0)
+            recency = 1.0 / (1.0 + 0.5 * age_days)                        # 越近越相关
+            weight = (h["score"] or 0.0) * (1.0 + 0.3 * (row.importance or 1)) * recency
+            scored.append((weight, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked = [row for _, row in scored[:top_k]]
+
+    # 命中不足 → 补最近几条生效记忆（覆盖"刚才那个/上次"类提问）
+    if len(picked) < top_k:
+        recent = sorted(rows, key=lambda r: r.created_at or datetime.min, reverse=True)
+        for r in recent:
+            if all(r.id != p.id for p in picked):
+                picked.append(r)
+            if len(picked) >= top_k:
+                break
+
+    if not picked:
+        return await get_user_profile(user_id)
+
+    # 热度反馈：被召回的行 importance +1（封顶 10）+ 刷新 last_access（用得越多越靠前）
+    async with AsyncSessionLocal() as db:
+        for row in picked[:top_k]:
+            r = await db.get(LongTermMemory, row.id)
+            if r:
+                r.last_access_at = now
+                r.importance = min(10, (r.importance or 1) + 1)
+        await db.commit()
+
+    lines = []
+    for row in picked[:top_k]:
+        prefix = "（事件）" if row.kind == KIND_EPISODIC else ""
+        lines.append(f"{prefix}{row.text}")
+    return "\n".join(lines)
+
+
+async def list_long_term_memories(user_id: int) -> list[dict]:
+    """列该用户生效中的长期记忆（管理接口用），按时间倒序，两类都展示"""
+    rows = await _active_rows(user_id)
+    rows.sort(key=lambda r: r.created_at or datetime.min, reverse=True)
+    return [{
+        "id": r.id,
+        "kind": r.kind,
+        "text": r.text,
+        "importance": r.importance,
+        "source_session": r.source_session,
+        "created_at": r.created_at.isoformat() if r.created_at else "",
+        "last_access_at": r.last_access_at.isoformat() if r.last_access_at else "",
+    } for r in rows]
+
+
+async def delete_long_term_memory(user_id: int, mem_id: int) -> bool:
+    """删单条长期记忆（连带删它的向量点 + 重算兜底画像），返回是否存在"""
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(select(LongTermMemory).where(
+            LongTermMemory.id == mem_id, LongTermMemory.user_id == user_id,
+        ))).scalars().first()
+        if not row:
+            return False
+        pid, kind = row.qdrant_point_id, row.kind
+        await db.delete(row)
+        await db.commit()
+    if pid:
+        delete_points(MEMORY_COLLECTION, [pid])
+    if kind == KIND_SEMANTIC:
+        await _sync_profile_fallback(user_id)
+    return True
 
 
 async def save_uploaded_doc(session_id: str, user_id: int, filename: str, content: str) -> None:

@@ -9,9 +9,11 @@ from backend.api.routes.dashboard import router as dashboard_router
 from backend.api.routes.auth import router as auth_router
 from backend.api.routes.upload import router as upload_router
 from backend.api.routes.session import router as session_router
+from backend.api.routes.memory import router as memory_router
 from backend.api.middleware import RequestLogMiddleware, ExceptionHandlerMiddleware
 from backend.db.models.base import Base
 from backend.db.models.insight_cache import InsightCache  # noqa: F401 触发注册（让 metadata 发现新表）
+from backend.db.models.user_memory import LongTermMemory  # noqa: F401 触发注册（让 metadata 发现新表）
 from backend.db.session import engine
 
 # 配置日志
@@ -51,6 +53,7 @@ app.include_router(dashboard_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(upload_router, prefix="/api")
 app.include_router(session_router, prefix="/api")
+app.include_router(memory_router, prefix="/api")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

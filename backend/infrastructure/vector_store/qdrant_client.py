@@ -88,3 +88,11 @@ def delete_by_user(collection_name: str, user_id: int):
             FieldCondition(key="user_id", match=MatchValue(value=user_id)),
         ]),
     )
+
+
+def delete_points(collection_name: str, point_ids: list[str]) -> None:
+    """按点 id 删除一批向量（增量记忆：作废旧版本/用户删单条记忆时用，替代整组清空）"""
+    if not point_ids:
+        return
+    c = get_client()
+    c.delete(collection_name=collection_name, points_selector=point_ids)
