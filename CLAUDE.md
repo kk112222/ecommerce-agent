@@ -24,7 +24,7 @@
 
 ---
 
-## 当前完成状态（2026-09-04）
+## 当前完成状态（2026-09-08）
 
 ### 已完成 ✅
 
@@ -88,7 +88,7 @@
 - `scripts/build_kb.py` — 知识库构建（自动识别格式→切块→embedding→入库）
 - `scripts/test_agent.py` / `test_agent_llm.py` / `test_llm.py` — 测试脚本
 
-### 增补（08-28 → 09-04）
+### 增补（08-28 → 09-08）
 
 - **会话重命名 + 彻底删除 ✅（08-28，0a1aa18）**：SessionSidebar 编辑态（hover/双击进 Input，Enter 提交）＋删除二次确认；后端 delete 从软删升物理删除（`delete(ChatMessage/ChatSession)`）。后续修 `d5ba43c`：物理删除连带清 uploaded_doc
 - **AI 洞察生成提速 ✅（08-28，0e720ec）**：当天缓存秒开（insight_cache 表，startup 幂等 create_all 补表）+ `?refresh=true` 强制重生成；LLM 失败不写缓存
@@ -96,6 +96,7 @@
 - **聊天输出自适应可视化 ✅（09-04，0677a8c）**：Synthesizer prompt 末尾注入 `VIZ_RULES`——结论适合图/表时在报告最末尾追加且仅一个 ```` ```viz ```` JSON 块（type 限 line/bar/column/table，数值必须逐字照抄子任务结果、禁止编造）。纯文本协议→零 schema 改动、历史重放免费。前端 `VizBlock.tsx`（parseViz 抽块 + Area/Column/Bar/Table 渲染）三层容错：块未闭合占位 Spin / JSON 坏或未知 type 弱提示不崩
 - **SSE 链路异常兜底 ✅（09-04，0677a8c）**：run_graph try/except/finally——失败也推 error 事件 + **finally 必送 None 哨兵**，否则 LLM 挂了 SSE 永久挂起、前端无限 loading；前端 switch 加 error case（标红 + message.error + 结束 loading）
 - **模型切换 ✅**：当前对话模型 qwen3.8-27b（改 .env `LLM_MODEL`，改完重启后端生效）。坑：DashScope 对话模型免费额度独立于 embedding/rerank（403 只挂聊天、RAG 正常）
+- **长期记忆大改造 ✅（09-08，fe5364e）**：接外部评审 M1/M3/M4/M5/M6，三层记忆从"删光重建"改**增量式**。SQLite 行 = 唯一事实源（新表 `long_term_memories`），qdrant 只当向量索引。kind 分桶：semantic（语义画像，difflib 增量合并：≥0.90 同条刷新 / 0.45~0.90 作废旧行重写 / <0.45 新增）/ episodic（情景记忆，append+去重）。extractor 双桶、原料整轮（M1）；per-user asyncio.Lock（M3）；加权召回；`GET/DELETE /api/memory` 管理接口（M6）；qdrant_client 加 delete_points。验证：scripts/verify_memory_incremental.py 全绿；旧 qdrant 13 点已由 scripts/backfill_legacy_memory.py 幂等回填成行。边界：M2 只做寒暄跳过轻量版、episodic 默认不过期、管理 UI 未做
 
 ### 尚未完成 ❌
 
