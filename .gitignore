@@ -41,6 +41,9 @@ docker/data/
 logs/
 *.log
 
+# Agent 生成的文档产物（运行期文件，不进版本库）
+outputs/
+
 # 系统
 .DS_Store
 Thumbs.db

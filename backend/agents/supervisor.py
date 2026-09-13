@@ -1,11 +1,12 @@
 import asyncio
 from backend.core.agent.base import AgentGraph
-from backend.core.llm.base import Message
 from backend.agents.intent_classifier import IntentClassifier
 from backend.agents.planner import Planner
 from backend.agents.executor import Executor
 from backend.agents.synthesizer import Synthesizer
-from backend.agents.data_analysis.simple_agent import ReActAgent
+from backend.agents.content_gen.content_agent import ContentAgent
+from backend.agents.customer_service.service_agent import ServiceAgent
+from backend.agents.document.document_agent import DocumentAgent
 
 
 def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
@@ -15,11 +16,17 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
         分析类: planner → executor(并行) → synthesize
         内容类: content(ReAct 生成文案/标题)
         客服类: service(ReAct 查知识库)
+        文档类: document(ReAct 解析/优化/生成落盘)
     """
     classifier = IntentClassifier(llm)
     planner = Planner(llm, registry)
     executor = Executor(llm, registry)
     synthesizer = Synthesizer(llm, registry)
+    # 角色 Agent：人格 prompt 和上下文组装收在各自文件里（content_gen / customer_service），
+    # supervisor 只负责"什么时候派给谁"，不关心角色内部怎么写
+    content_agent = ContentAgent(llm, registry)
+    service_agent = ServiceAgent(llm, registry)
+    document_agent = DocumentAgent(llm, registry)
 
     # ============ 意图分类节点（所有问题的第一站） ============
     async def intent_node(state):
@@ -71,43 +78,40 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
         return state
 
     # ============ 内容生成链路（文案/标题，不拆子任务） ============
+    # 注意：角色知识（人格/边界/上下文怎么拼）已收进 ContentAgent（content_gen/content_agent.py），
+    # 这里只做调度：跑角色 → 结果放 state → 推 report 事件
     async def content_node(state):
-        system_prompt = """你是电商内容创作专员。你只负责根据用户要求生成商品文案/标题，不要分析经营数据。
-可用工具：
-- title_optimizer：优化/生成商品标题
-- copy_generator：生成商品文案/营销话术
-只调用内容类工具，不要查销售库存数据。直接产出最终文案。"""
-        agent = ReActAgent(llm, registry)
-        messages = [Message(role="system", content=system_prompt)]
-        if state.get("history"):
-            messages.append(Message(role="system", content=f"用户之前的对话：\n{state['history']}"))
-        if state.get("user_profile"):
-            messages.append(Message(role="system", content=f"用户画像：\n{state['user_profile']}"))
-        messages.append(Message(role="user", content=state["goal"]))
-        result = await agent.run(messages)
-        state["report"] = result
+        state["report"] = await content_agent.run(
+            goal=state["goal"],
+            history=state.get("history", ""),
+            user_profile=state.get("user_profile", ""),
+        )
         if on_event:
-            await on_event({"type": "report", "report": result})
+            await on_event({"type": "report", "report": state["report"]})
         return state
 
     # ============ 客服问答链路（查知识库） ============
     async def service_node(state):
-        system_prompt = """你是电商售后客服。用户问的是售后政策、退货规则等问题，需要查知识库才能准确回答。
-可用工具：
-- search_knowledge_base：检索客服知识库
-先检索知识库拿到政策原文，再据此回答。如果知识库里没有答案，如实说"知识库没有查到"，不要编造。"""
-        agent = ReActAgent(llm, registry)
-        messages = [Message(role="system", content=system_prompt)]
-        if state.get("history"):  # 历史非空才插
-            messages.append(Message(role="system",
-                                    content=f"用户之前的对话：\n{state['history']}"))
-        if state.get("user_profile"):
-            messages.append(Message(role="system", content=f"用户画像：\n{state['user_profile']}"))
-        messages.append(Message(role="user", content=state["goal"]))
-        result = await agent.run(messages)
-        state["report"] = result
+        state["report"] = await service_agent.run(
+            goal=state["goal"],
+            history=state.get("history", ""),
+            user_profile=state.get("user_profile", ""),
+        )
         if on_event:
-            await on_event({"type": "report", "report": result})
+            await on_event({"type": "report", "report": state["report"]})
+        return state
+
+    # ============ 文档处理链路（解析/优化/生成落盘） ============
+    async def document_node(state):
+        # 比其它角色多传 uploaded_data：文档原料来自用户上传（state 里已解析好的文本）
+        state["report"] = await document_agent.run(
+            goal=state["goal"],
+            history=state.get("history", ""),
+            user_profile=state.get("user_profile", ""),
+            uploaded_data=state.get("uploaded_data", ""),
+        )
+        if on_event:
+            await on_event({"type": "report", "report": state["report"]})
         return state
 
     # ============ 组装图 ============
@@ -118,6 +122,7 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
     graph.add_node("synthesize", synthesize_node)
     graph.add_node("content", content_node)
     graph.add_node("service", service_node)
+    graph.add_node("document", document_node)
 
     # 数据分析链路：串行
     graph.add_edge("planner", "executor")
@@ -130,6 +135,7 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
         "analysis": "planner",
         "content": "content",
         "service": "service",
+        "document": "document",
     })
 
     graph.entry_point = "intent"

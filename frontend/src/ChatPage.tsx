@@ -39,11 +39,13 @@ const intentLabels: Record<string, string> = {
   analysis: '数据分析',
   content: '内容生成',
   service: '客服问答',
+  document: '文档处理',
 };
 const intentColor: Record<string, string> = {
   analysis: '#ff7a3d',
   content: '#e8c92f',
   service: '#9a8cff',
+  document: '#4fd1c5',
 };
 
 // markdown 渲染样式：深色主题适配，标题用 antd 排版

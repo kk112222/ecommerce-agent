@@ -44,7 +44,7 @@ async def chat(request: ChatRequest, current_user: User = Depends(get_current_us
     sid = request.session_id or str(uuid.uuid4())[:8]
     llm = create_llm()
     registry = ToolRegistry()
-    register_all_tools(registry, llm)
+    register_all_tools(registry, llm, context={"user_id": current_user.id, "session_id": sid})
     history_text = await get_messages(sid, current_user.id)
     await save_message(sid, current_user.id, "user", request.message)
     await upsert_session(sid, current_user.id, request.message)   # 同步会话元信息（多会话列表）
@@ -65,7 +65,7 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
     sid = request.session_id or str(uuid.uuid4())[:8]
     llm = create_llm()
     registry = ToolRegistry()
-    register_all_tools(registry, llm)
+    register_all_tools(registry, llm, context={"user_id": current_user.id, "session_id": sid})
     # ① 读历史（在存当前消息之前）
     history_text = await get_messages(sid, current_user.id)
     # ② 读用户画像（长期记忆）
