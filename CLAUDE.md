@@ -86,7 +86,8 @@
 - `scripts/seed_data.py` — 模拟数据
 - `scripts/cli.py` — CLI 命令行 chat
 - `scripts/build_kb.py` — 知识库构建（自动识别格式→切块→embedding→入库）
-- `scripts/test_agent.py` / `test_agent_llm.py` / `test_llm.py` — 测试脚本
+- `scripts/smoke_*.py` — 手工冒烟脚本（无断言、要真 LLM/网络，用来手动看链路通不通）
+- **自动化测试在 `tests/`**（pytest，离线假 LLM、无需 .env）：`PYTHONPATH=. .venv/Scripts/python -m pytest`
 
 ### 增补（08-28 → 09-08）
 
@@ -187,7 +188,10 @@ ecommerce-agent/
 │   ├── seed_data.py                # 模拟数据
 │   ├── build_kb.py                 # 知识库构建
 │   ├── cli.py                      # CLI 命令行
-│   └── test_agent.py               # Agent 测试
+│   ├── smoke_*.py                  # 手工冒烟（真 LLM，非测试）
+│   └── rag_eval.py                 # RAG 检索评测（出数字）
+│
+├── tests/                          # pytest 离线测试套件（假 LLM，无需 .env）
 │
 ├── data_v3.db                      # SQLite 数据库文件
 ├── qdrant_data/                    # Qdrant 本地存储

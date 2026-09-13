@@ -74,6 +74,8 @@ def ask_sales(user_input: str):
 - 换模型 = 换一个实现，业务代码**零改动**
 - 测试时能轻松替换成"假 LLM"，不花钱不打真 API
 
+**一个通俗类比**：把 `BaseLLM` 想成 **USB-C 接口标准**，你的 Agent 就是手机。只要充电头支持 USB-C，管它是原装、第三方还是快充协议，插上就能用。换模型 = 换充电头，手机（Agent）完全不用改。工厂模式就是那个"帮你挑充电头"的插线板。
+
 ---
 
 ## 三、统一数据结构：屏蔽 API 差异
@@ -252,10 +254,10 @@ dashscope_api_key: str = ""         # 千问的 key
 
 ## 七、验证一下
 
-写抽象层不能光看代码，跑起来才算数。`scripts/test_llm.py` 同时测了普通对话和流式对话：
+写抽象层不能光看代码，跑起来才算数。`scripts/smoke_llm.py` 同时测了普通对话和流式对话：
 
 ```bash
-python scripts/test_llm.py
+python scripts/smoke_llm.py
 ```
 
 ```text
@@ -277,6 +279,45 @@ python scripts/test_llm.py
 - **抽象基类**：只声明 `chat` / `chat_stream`，实现细节下沉到实现类
 - **工厂模式**：`create_llm()` 一行切换，换模型不动业务代码
 - **踩坑**：Windows SSL、千问字段 `KeyError`、`result_format="message"`
+
+---
+
+## 练手挑战
+
+> 光看不练假把式。这三题从易到难，做完比看十遍都懂。
+> 不用怕 —— 前两题本质就是把本章思路**倒着实现一遍**。
+
+**挑战一（必做）：写一个 FakeLLM**
+
+不调任何真实 API，自己实现一个假模型，拿它跑通整条链路。
+
+```python
+class FakeLLM(BaseLLM):
+    async def chat(self, messages, tools=None, temperature=0.7):
+        return LLMResponse(content="我是假的，但我能跑通链路！")
+
+    async def chat_stream(self, messages, tools=None, temperature=0.7):
+        for ch in "我是假的，但我能跑通链路！":
+            yield ch
+```
+
+**验收标准**：写个 `test_fake.py`，调 `await llm.chat([...])` 能拿到写死的回答，流式能逐字吐。
+
+**挑战二（推荐）：把 FakeLLM 接进工厂**
+
+在 `factory.py` 加一个分支，让 `.env` 里 `LLM_PROVIDER=fake` 就能切过去。
+
+**验收标准**：改 `.env` 后跑 `scripts/smoke_llm.py`，不再打真 API、直接输出固定文案 —— 证明"加实现 + 加分支，业务零改动"不是吹的。
+
+**挑战三（加分）：接第二家真模型**
+
+很多国产模型（DeepSeek、智谱）提供 OpenAI 兼容接口。写一个 `OpenAIChatLLM` 继承 `BaseLLM`，实现 `chat` / `chat_stream`，再把它加进工厂。
+
+**提示**：照抄 `QwenLLM` 的结构就行，重点对比各家**流式返回的字段差异**。
+
+**验收标准**：填上真 key，普通对话 + 流式都能正常出字。
+
+> 做完挑战一、二，你就亲手把"为什么上层只依赖抽象"体会了一遍；做完挑战三，你就有资格说"我会写 LLM 抽象层"了。
 
 ---
 
