@@ -40,6 +40,28 @@ async def test_document_agent_writes_file(tmp_path):
     assert any("【上传文档】" in m.content for m in llm.calls[0])
 
 
+async def test_document_agent_emits_download_event(tmp_path):
+    """落盘成功后必须推 document 事件（P0-3：前端靠它给下载入口），
+    且事件里带够拼下载 URL 的信息（session_id + filename）"""
+    events: list[dict] = []
+    llm = FakeLLM([
+        LLMResponse(content="", tool_calls=[ToolCall(
+            id="c1", name="write_document",
+            arguments={"filename": "竞品报告", "content": "内容", "format": "md"})]),
+        LLMResponse(content="已生成。"),
+    ])
+    registry = ToolRegistry()
+    register_all_tools(registry, llm, context={
+        "user_id": 7, "session_id": "s", "on_document": events.append,
+    })
+    await DocumentAgent(llm, registry).run(goal="生成竞品报告")
+
+    assert len(events) == 1
+    evt = events[0]
+    assert evt["type"] == "document" and evt["filename"] == "竞品报告.md"
+    assert evt["session_id"] == "s" and evt["bytes"] > 0
+
+
 async def test_document_agent_reports_error_on_bad_args():
     """坏参数不崩：registry 返回可读错误 → ReAct 拿到 tool 消息继续（这里以最终回复收尾）"""
     llm = FakeLLM([

@@ -85,7 +85,17 @@ export type StreamEvent =
   | { type: "token"; content: string }   // 报告逐字片段（打字机效果）
   | { type: "report"; report: string }
   | { type: "session"; session_id: string }
+  | GeneratedDocument                     // write_document 落盘成功 → 前端给下载入口
   | { type: "error"; message: string };   // Agent/LLM 链路失败（后端兜底事件，用于结束 loading）
+
+/** 生成文档落盘事件（后端 WriteDocument 工具推的） */
+export interface GeneratedDocument {
+  type: "document";
+  path: string;         // outputs/user_1/s1/竞品分析.md
+  bytes: number;
+  filename: string;     // 竞品分析.md
+  session_id: string;
+}
 
 /**
  * 流式聊天 —— SSE 推送思考过程 + token
@@ -215,4 +225,36 @@ export async function uploadFile(file: File, sessionId: string): Promise<UploadR
     throw new Error(typeof detail === 'string' ? detail : `上传失败: ${res.status}`);
   }
   return res.json();
+}
+
+// ==================== 生成文档（下载 / 列表） ====================
+
+/** 列出当前用户生成过的文档（刷新页面后仍能找回下载入口） */
+export async function fetchMyDocuments(): Promise<GeneratedDocument[]> {
+  const res = await fetch('/api/documents', { headers: authHeaders() });
+  if (!res.ok) throw new Error(`获取文档列表失败: ${res.status}`);
+  const body = await res.json();
+  return body.documents ?? [];
+}
+
+/**
+ * 下载生成文档 —— 走 fetch 拿 blob 再触发保存。
+ * 不能直接 <a href="/api/documents/...">：接口要 Bearer token，a 标签带不上请求头。
+ */
+export async function downloadDocument(sessionId: string, filename: string): Promise<void> {
+  const url = `/api/documents/${encodeURIComponent(sessionId)}/${encodeURIComponent(filename)}`;
+  const res = await fetch(url, { headers: authTokenHeaders() });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(typeof body?.detail === 'string' ? body.detail : `下载失败: ${res.status}`);
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);   // 及时释放，否则 blob 一直占内存
 }

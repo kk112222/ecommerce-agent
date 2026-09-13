@@ -6,7 +6,9 @@
 import pytest
 
 from backend.infrastructure import doc_output
-from backend.infrastructure.doc_output import safe_output_path, write_document
+from backend.infrastructure.doc_output import (
+    list_documents, resolve_user_file, safe_output_path, write_document,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,3 +51,42 @@ def test_write_document_formats(tmp_path, fmt):
     assert info["path"].startswith("outputs/")
     assert info["bytes"] > 0
     assert (tmp_path / "user_7" / "s" / f"验证文档.{fmt}").exists()
+
+
+# ==================== 读侧（下载/列表，P0-3 补的） ====================
+
+def test_download_own_file_ok(tmp_path):
+    write_document("内容", "报告", "md", user_id=1, session_id="s1")
+    p = resolve_user_file(1, "s1", "报告.md")
+    assert p.is_file() and p.name == "报告.md"
+
+
+def test_download_other_users_file_blocked(tmp_path):
+    """越权下载：文件确实存在，但不是 user_2 的 → 必须拒绝"""
+    write_document("别人的内容", "报告", "md", user_id=1, session_id="s1")
+    with pytest.raises(ValueError):
+        resolve_user_file(2, "s1", "报告.md")
+
+
+def test_download_path_traversal_blocked(tmp_path):
+    """URL 里塞 ../../.env 之类：清洗后落回自己目录，越界/不存在一律拒绝"""
+    write_document("内容", "报告", "md", user_id=1, session_id="s1")
+    with pytest.raises(ValueError):
+        resolve_user_file(1, "s1", "../../../.env")
+    with pytest.raises(ValueError):
+        resolve_user_file(1, "..", "报告.md")
+
+
+def test_download_exe_extension_rejected(tmp_path):
+    (tmp_path / "user_1").mkdir()
+    (tmp_path / "user_1" / "evil.exe").write_bytes(b"MZ")
+    with pytest.raises(ValueError):
+        resolve_user_file(1, ".", "evil.exe")
+
+
+def test_list_documents_only_own(tmp_path):
+    write_document("a", "我的", "md", user_id=1, session_id="s1")
+    write_document("b", "别人的", "md", user_id=2, session_id="s1")
+    mine = list_documents(1)
+    assert [d["filename"] for d in mine] == ["我的.md"]
+    assert mine[0]["session_id"] == "s1"

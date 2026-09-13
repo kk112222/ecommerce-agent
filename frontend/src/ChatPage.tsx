@@ -4,11 +4,12 @@ import {
 } from 'antd';
 import {
   SendOutlined, RobotOutlined, UserOutlined,
-  UploadOutlined, FileTextOutlined, ProfileOutlined, ToolOutlined,
+  UploadOutlined, FileTextOutlined, ProfileOutlined, ToolOutlined, DownloadOutlined,
 } from '@ant-design/icons';
 import {
   sendMessageStream, uploadFile, fetchSessionMessages,
-  type StreamEvent, type PlanItem, type UploadResult,
+  fetchMyDocuments, downloadDocument,
+  type StreamEvent, type PlanItem, type UploadResult, type GeneratedDocument,
 } from './api';
 import TracePanel, { type TraceStep } from './TracePanel';
 import ReactMarkdown from 'react-markdown';
@@ -97,6 +98,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
   const [steps, setSteps] = useState<TraceStep[]>([]);   // 本次提问的执行时间线
   const [uploaded, setUploaded] = useState<UploadResult[]>([]);   // 本会话已上传的文件
   const [uploading, setUploading] = useState(false);
+  const [docs, setDocs] = useState<GeneratedDocument[]>([]);      // 本会话已生成的文件（可下载）
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -115,6 +117,19 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
     })();
     return () => { alive = false; };   // 防卸载后 setState
   }, [initialSessionId]);
+
+  // 切会话时拉一次"我生成过的文档"，只留本会话的 —— 刷新页面后下载入口不丢
+  useEffect(() => {
+    if (!sessionId) { setDocs([]); return; }
+    let alive = true;
+    (async () => {
+      try {
+        const all = await fetchMyDocuments();
+        if (alive) setDocs(all.filter(d => d.session_id === sessionId));
+      } catch { /* 未登录/后端未启动，忽略 */ }
+    })();
+    return () => { alive = false; };
+  }, [sessionId]);
 
   // 追加/覆盖最后一个 assistant 气泡（报告打字机累积用）
   const appendAssistant = useCallback((content: string, replace = false) => {
@@ -205,6 +220,14 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
             finishStep('report', {});
             setLoading(false);
             break;
+          case 'document':
+            // 文档已落盘：立刻给出下载入口（按 path 去重，避免同轮重复推送）
+            setDocs(prev => prev.some(d => d.path === event.path) ? prev : [...prev, event]);
+            pushStepIfAbsent({
+              id: `doc-${event.path}`, kind: 'report',
+              label: `生成文档 · ${event.filename}`, status: 'done', startedAt: Date.now(),
+            });
+            break;
           case 'error':
             // 后端链路异常（LLM 失败等）：标红 + 报错 + 结束 loading，别让界面永久转圈
             setSteps(prev => prev.map(s => s.status === 'running' ? { ...s, status: 'error' } : s));
@@ -247,6 +270,15 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
   const pushStepIfAbsent = (step: TraceStep) => {
     setSteps(prev => prev.some(s => s.id === step.id) ? prev : [...prev, step]);
   };
+
+  // 下载生成文档（带 token 走 fetch 拿 blob，见 api.ts 的说明）
+  async function handleDownload(d: GeneratedDocument) {
+    try {
+      await downloadDocument(d.session_id, d.filename);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '下载失败');
+    }
+  }
 
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -357,6 +389,25 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
             </div>
           );
         })}
+
+        {/* 生成的文档：Agent 落盘后立刻出现在这里，点一下就能下载（P0-3 闭环的那一半） */}
+        {docs.length > 0 && (
+          <Card size="small" style={{ marginTop: 12, background: C.surface, borderColor: C.borderSoft, borderLeft: '3px solid #4fd1c5' }}
+            styles={{ body: { padding: '10px 16px' } }}>
+            <Text strong style={{ fontSize: 13, color: C.text, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <FileTextOutlined style={{ color: '#4fd1c5' }} /> 本次生成的文件
+            </Text>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+              {docs.map(d => (
+                <Button key={d.path} size="small" icon={<DownloadOutlined />}
+                  onClick={() => handleDownload(d)}
+                  style={{ fontWeight: 500 }}>
+                  {d.filename}（{(d.bytes / 1024).toFixed(1)} KB）
+                </Button>
+              ))}
+            </div>
+          </Card>
+        )}
 
         {/* 本次提问的执行时间线：意图→计划→子任务→报告 */}
         {steps.length > 0 && <TracePanel steps={steps} />}

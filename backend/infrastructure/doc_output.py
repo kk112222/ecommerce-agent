@@ -78,3 +78,45 @@ def write_document(content: str, filename: str, fmt: str = "md",
 
     rel = path.relative_to(OUTPUTS_DIR)
     return {"path": (Path("outputs") / rel).as_posix(), "bytes": path.stat().st_size}
+
+
+# ==================== 读侧（下载 / 列表） ====================
+# 与写侧同样是不信任输入：URL 里的 session_id / filename 由用户构造，必须走同一套清洗 + 越界校验，
+# 且永远拼在 user_<当前登录用户> 目录下 —— 归属校验靠"路径里写死 user_id"，不靠事后比对。
+
+def user_root(user_id: int) -> Path:
+    """当前用户的产出根目录（下载/列表的唯一入口）"""
+    return (OUTPUTS_DIR / f"user_{int(user_id)}").resolve()
+
+
+def resolve_user_file(user_id: int, session_id: str, filename: str) -> Path:
+    """把 URL 参数解析成 outputs 下属于该用户的真实文件；非法或不存在直接抛 ValueError"""
+    ext = Path(filename).suffix.lstrip(".").lower()
+    if ext not in ALLOWED_FORMATS:
+        raise ValueError(f"不支持的格式：{ext or '(无扩展名)'}")
+    path = safe_output_path(Path(filename).stem, ext, user_id=user_id, session_id=session_id)
+    if not path.is_relative_to(user_root(user_id)):
+        raise ValueError("路径越界，只允许访问自己的 outputs 目录")
+    if not path.is_file():
+        raise ValueError("文件不存在或已被清理")
+    return path
+
+
+def list_documents(user_id: int) -> list[dict]:
+    """列出该用户生成过的所有文档（按修改时间倒序），供前端展示下载入口"""
+    root = user_root(user_id)
+    if not root.is_dir():
+        return []
+    items = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lstrip(".").lower() in ALLOWED_FORMATS:
+            stat = p.stat()
+            items.append({
+                "session_id": p.parent.name,
+                "filename": p.name,
+                "bytes": stat.st_size,
+                "modified_at": int(stat.st_mtime),
+                "path": (Path("outputs") / p.relative_to(OUTPUTS_DIR)).as_posix(),
+            })
+    items.sort(key=lambda x: x["modified_at"], reverse=True)
+    return items
