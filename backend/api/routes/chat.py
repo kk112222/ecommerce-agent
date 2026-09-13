@@ -10,6 +10,8 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from backend.agents.supervisor import build_supervisor
 from backend.api.schemas.chat import ChatRequest, ChatResponse
+from backend.core.config import settings
+from backend.core.llm.budget import BudgetedLLM, BudgetExceeded, UsageBudget
 from backend.core.llm.factory import create_llm
 from backend.core.tool.registry import ToolRegistry
 from backend.tools import register_all_tools
@@ -54,6 +56,18 @@ def _spawn(coro) -> asyncio.Task:
     return task
 
 
+def _budgeted_llm() -> tuple:
+    """本轮对话的 LLM + 预算账本（P2-11）
+
+    在 route 层包这一次，往下（planner/executor/synthesizer/角色 Agent/工具内部拿到的 llm）
+    就都是同一个 BudgetedLLM —— 这才叫"全局"预算：只卡 Graph 节点的话，
+    ReAct 循环（每个子任务 ≤10 轮）和工具自己发起的调用照样能无限烧。
+    """
+    budget = UsageBudget(max_tokens=settings.agent_budget_tokens,
+                         max_seconds=settings.agent_budget_seconds)
+    return BudgetedLLM(create_llm(), budget), budget
+
+
 router = APIRouter()
 
 logger = logging.getLogger("ecommerce-agent")   # 与中间件同 logger，日志格式统一
@@ -65,7 +79,7 @@ logger = logging.getLogger("ecommerce-agent")   # 与中间件同 logger，日�
 async def chat(request: ChatRequest, current_user: User = Depends(get_current_user)):
     """普通接口：一次性返回完整回复"""
     sid = request.session_id or str(uuid.uuid4())[:8]
-    llm = create_llm()
+    llm, budget = _budgeted_llm()
     registry = ToolRegistry()
     register_all_tools(registry, llm, context={"user_id": current_user.id, "session_id": sid})
     history_text = await get_messages(sid, current_user.id)
@@ -74,19 +88,23 @@ async def chat(request: ChatRequest, current_user: User = Depends(get_current_us
     graph = build_supervisor(llm, registry)
     profile = await recall_user_memories(current_user.id, request.message)
     uploaded_data = await get_uploaded_docs(sid, current_user.id)
-    final = await graph.invoke({"goal": request.message, "history": history_text,
-                                "user_profile": profile, "uploaded_data": uploaded_data})
-    result = final["report"]
+    try:
+        final = await graph.invoke({"goal": request.message, "history": history_text,
+                                    "user_profile": profile, "uploaded_data": uploaded_data})
+        result = final["report"]
+    except BudgetExceeded as e:
+        # 各节点内部已经降级过，正常到不了这里；留一层兜底，别把 500 抛给前端
+        result = f"⚠️ 本轮预算用尽（{e.detail}），未能生成完整报告，请缩小问题范围后重试。"
     await save_message(sid, current_user.id, "assistant", result)
     _spawn(_extract_in_background(current_user.id, sid, request.message, result))
-    return ChatResponse(reply=result, session_id=sid)
+    return ChatResponse(reply=result, session_id=sid, usage=budget.snapshot())
 
 
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest, current_user: User = Depends(get_current_user)):
     """流式接口：SSE 推送 计划 → 子任务 → 报告"""
     sid = request.session_id or str(uuid.uuid4())[:8]
-    llm = create_llm()
+    llm, budget = _budgeted_llm()
     # 事件队列在这里建（而不是在 event_stream 里）：文档工具落盘后要主动往里塞
     # 一条 document 事件，前端才能立刻拿到下载入口 —— 这就是 P0-3 的前端那一半
     queue: asyncio.Queue = asyncio.Queue()
@@ -117,11 +135,20 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(get_cur
                 if report:
                     await save_message(sid, current_user.id, "assistant", report)
                 _spawn(_extract_in_background(current_user.id, sid, goal, report))
+            except BudgetExceeded as e:
+                # 节点内部已经逐级降级过，正常到不了这里；万一到了，也照样给一句人话并落库，
+                # 不能出现"用户看到空白、历史里也没有这一轮"的情况
+                logger.warning("本轮 LLM 预算用尽：%s", e.detail)
+                report = f"⚠️ 本轮预算用尽（{e.detail}），请缩小问题范围后重试。"
+                await save_message(sid, current_user.id, "assistant", report)
             except Exception as e:
                 # Agent/LLM 链路失败也必须把结束信号送出去（finally），否则 SSE 永远挂起、前端无限转圈
                 logger.exception("Agent 链路异常")
                 queue.put_nowait({"type": "error", "message": f"分析失败：{e}"})
             finally:
+                # 用量汇总必须在结束信号之前推（P2-11）：无论成败都让用户看到这轮花了多少，
+                # 也是排查"这轮为什么慢/贵"的第一手数据
+                queue.put_nowait({"type": "usage", "usage": budget.snapshot()})
                 await queue.put(None)          # 结束信号：无论成败必达
 
         task = asyncio.create_task(run_graph())

@@ -86,7 +86,21 @@ export type StreamEvent =
   | { type: "report"; report: string }
   | { type: "session"; session_id: string }
   | GeneratedDocument                     // write_document 落盘成功 → 前端给下载入口
+  | { type: "usage"; usage: LlmUsage }    // 本轮 LLM 用量汇总（结束前必推）
   | { type: "error"; message: string };   // Agent/LLM 链路失败（后端兜底事件，用于结束 loading）
+
+/** 本轮 LLM 用量（P2-11）：ReAct 循环次数由 LLM 自决，不显示出来成本就是黑盒 */
+export interface LlmUsage {
+  calls: number;             // 本轮的 LLM 调用次数
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  estimated_calls: number;   // 其中靠估算（流式无 usage）的次数
+  elapsed_ms: number;
+  max_tokens: number;        // 配置的上限，0 = 不限制
+  max_seconds: number;
+  exhausted: '' | 'tokens' | 'time';   // 非空 = 这轮被预算截断了
+}
 
 /** 生成文档落盘事件（后端 WriteDocument 工具推的） */
 export interface GeneratedDocument {

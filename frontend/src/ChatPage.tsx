@@ -9,7 +9,7 @@ import {
 import {
   sendMessageStream, uploadFile, fetchSessionMessages,
   fetchMyDocuments, downloadDocument,
-  type StreamEvent, type PlanItem, type UploadResult, type GeneratedDocument,
+  type StreamEvent, type PlanItem, type UploadResult, type GeneratedDocument, type LlmUsage,
 } from './api';
 import TracePanel, { type TraceStep } from './TracePanel';
 import ReactMarkdown from 'react-markdown';
@@ -99,6 +99,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
   const [uploaded, setUploaded] = useState<UploadResult[]>([]);   // 本会话已上传的文件
   const [uploading, setUploading] = useState(false);
   const [docs, setDocs] = useState<GeneratedDocument[]>([]);      // 本会话已生成的文件（可下载）
+  const [usage, setUsage] = useState<LlmUsage | null>(null);      // 上一轮的 LLM 用量（P2-11）
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -182,6 +183,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
 
     // 新一轮执行：重置时间线，先点亮"识别意图"
     setSteps([{ id: 'intent', kind: 'intent', label: '识别意图', status: 'running', startedAt: Date.now() }]);
+    setUsage(null);   // 上一轮的用量不留在这一轮，避免看错
 
     try {
       await sendMessageStream(text, sessionId, (event: StreamEvent) => {
@@ -227,6 +229,10 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
               id: `doc-${event.path}`, kind: 'report',
               label: `生成文档 · ${event.filename}`, status: 'done', startedAt: Date.now(),
             });
+            break;
+          case 'usage':
+            // 本轮用量汇总：不打断流程，只在报告下面挂一行小字（P2-11）
+            setUsage(event.usage);
             break;
           case 'error':
             // 后端链路异常（LLM 失败等）：标红 + 报错 + 结束 loading，别让界面永久转圈
@@ -411,6 +417,27 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
 
         {/* 本次提问的执行时间线：意图→计划→子任务→报告 */}
         {steps.length > 0 && <TracePanel steps={steps} />}
+
+        {/* 本轮 LLM 用量（P2-11）：一行小字，不抢报告主视觉，但成本和延迟不再是黑盒 */}
+        {usage && (
+          <div style={{
+            marginTop: 8, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+            fontFamily: C.mono, fontSize: 11.5, color: usage.exhausted ? C.accent : C.textWeak,
+          }}>
+            <span>本轮 LLM</span>
+            <span>{usage.calls} 次调用</span>
+            <span>·</span>
+            <span>{usage.total_tokens.toLocaleString()} tokens</span>
+            <span>·</span>
+            <span>{(usage.elapsed_ms / 1000).toFixed(1)}s</span>
+            {usage.estimated_calls > 0 && <span>（{usage.estimated_calls} 次为估算）</span>}
+            {usage.exhausted && (
+              <span style={{ color: C.accent }}>
+                已触及{usage.exhausted === 'tokens' ? ' token' : '时间'}上限，报告被截断
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* ============ 底部：上传区 + 输入区 ============ */}
