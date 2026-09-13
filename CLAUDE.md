@@ -24,7 +24,7 @@
 
 ---
 
-## 当前完成状态（2026-09-08）
+## 当前完成状态（2026-09-13）
 
 ### 已完成 ✅
 
@@ -37,10 +37,10 @@
 **Phase 1 - 数据层 + 数据工具：**
 - DB: SQLite + aiosqlite + SQLAlchemy 2.0 async
 - 模型: Product / Order / User（金额存分避免浮点精度问题）
-- 5 个数据分析工具全部注册可用：
-  - `sales_query` — 按日期查销售额
+- 5 个数据分析工具全部注册可用（名字以 `registry.tools` 为准，曾被文档写成 `sales_query`/`stock_alert`）：
+  - `query_sales` — 按日期查销售额
   - `category_query` — 按分类+日期查
-  - `stock_alert` — 库存低于阈值
+  - `check_stock` — 库存低于阈值
   - `user_profile` — 按会员等级统计
   - `product_query` — 按商品名模糊搜索
 - 模拟数据: 8 个中文商品 + 5 个用户 + 100 条订单
@@ -70,6 +70,8 @@
 - `POST /api/auth/*` — 注册/登录，JWT 鉴权
 - `POST /api/upload` — 文件上传解析（挂在会话下，供竞品对比）
 - `GET /api/sessions` + `GET/PATCH/DELETE /api/sessions/{sid}` — 多会话列表/历史/重命名/删除
+- `GET /api/memory` + `DELETE /api/memory/{id}` — 长期记忆可查看/可删除（+ 提炼计数）
+- `GET /api/documents` + `GET /api/documents/{sid}/{filename}` — 生成物列表/下载（归属校验）
 - 会话已持久化：`chat_messages`（消息）+ `chat_sessions`（会话元信息）两张表
 
 **前端：**
@@ -98,6 +100,14 @@
 - **SSE 链路异常兜底 ✅（09-04，0677a8c）**：run_graph try/except/finally——失败也推 error 事件 + **finally 必送 None 哨兵**，否则 LLM 挂了 SSE 永久挂起、前端无限 loading；前端 switch 加 error case（标红 + message.error + 结束 loading）
 - **模型切换 ✅**：当前对话模型 qwen3.8-27b（改 .env `LLM_MODEL`，改完重启后端生效）。坑：DashScope 对话模型免费额度独立于 embedding/rerank（403 只挂聊天、RAG 正常）
 - **长期记忆大改造 ✅（09-08，fe5364e）**：接外部评审 M1/M3/M4/M5/M6，三层记忆从"删光重建"改**增量式**。SQLite 行 = 唯一事实源（新表 `long_term_memories`），qdrant 只当向量索引。kind 分桶：semantic（语义画像，difflib 增量合并：≥0.90 同条刷新 / 0.45~0.90 作废旧行重写 / <0.45 新增）/ episodic（情景记忆，append+去重）。extractor 双桶、原料整轮（M1）；per-user asyncio.Lock（M3）；加权召回；`GET/DELETE /api/memory` 管理接口（M6）；qdrant_client 加 delete_points。验证：scripts/verify_memory_incremental.py 全绿；旧 qdrant 13 点已由 scripts/backfill_legacy_memory.py 幂等回填成行。边界：M2 只做寒暄跳过轻量版、episodic 默认不过期、管理 UI 未做
+
+### 增补（09-13，对照 docs/13 缺陷清单逐条修）
+
+- **生成文档闭环 ✅（09-13）**：文档 Agent 落盘 → SSE `document` 事件 → 前端"本次生成的文件"卡片点一下下载。`backend/api/routes/documents.py` + `infrastructure/doc_output.py` 读侧（只取末段文件名 + 扩展名白名单 + `is_relative_to` 归属校验，别人的文件一律 404，不区分"不存在/没权限"）。验证：scripts/smoke_documents_api.py + tests/test_documents_api.py
+- **长期记忆收尾 ✅（09-13）**：difflib 分不出"关注退货率 vs 关注退款率"这类平行偏好 → 0.45~0.90 歧义档交 LLM 判"更新 vs 并列"，判据坏了自动退回旧行为；"从未被认领"的作废加 50%/3 行护栏（避免单轮把画像清空）；召回不再灌 importance（热度 `last_access_at` 与语义权重 `importance` 分离）；episodic 加 30 天 TTL；SQLite↔qdrant 无共享事务 → `reconcile_memory()` 双向对账（补丢的向量/清孤儿点，`--dry-run` 可用）挂在 lifespan
+- **提炼任务可靠性 ✅（09-13）**：`create_task` 返回值持强引用（否则任务可能被 GC，"记忆时好时坏"）；per-user 锁换 `WeakValueDictionary`（原来只增不减）；失败落 `memory_extract_tasks` 表 + 启动重放 + `/api/memory` 暴露 ok/skipped/failed/retried 计数
+- **LLM 预算与用量 ✅（09-13）**：`BudgetedLLM` 装饰器包住 BaseLLM —— 预算必须在 LLM 层，因为调用次数是 ReAct 循环内部攒的（4×executor×≤10 轮），Graph 节点看不见。超限由 supervisor 各节点降级（保数据出报告）而非抛 500；用量随 `/chat` 响应与 SSE `usage` 事件上前端。真机实测：45 字回答实际消耗 805 completion tokens（思考 token 不体现在可见输出里）
+- **配置与健壮性 ✅（09-13）**：CORS 白名单取代 `*`、`lifespan` 取代弃用的 `on_event`、`.env` 里 DB_URL/密钥/echo 真正生效（原来配了不用）；planner 输出结构校验（兜底 id `tl`→`t1`、id 去重、缺 task 丢弃、编造工具名清空、上限 5 条）；executor 按 `tool_hint` 把 registry 收窄成子集（硬隔离，不再靠 prompt 软约束）；registry 按 spec 做类型校验 + 兜住工具本体异常；KB 按**语料内容指纹**失效缓存（重建知识库不用重启）。测试从 5 个文件扩到 14 个（103 项，全离线）
 
 ### 尚未完成 ❌
 
@@ -128,38 +138,49 @@ ecommerce-agent/
 │
 ├── backend/
 │   ├── core/                       # ★ 核心抽象层
-│   │   ├── llm/                    # LLM 接口（base/qwen/factory）
-│   │   ├── tool/                   # 工具系统（base/registry）
+│   │   ├── llm/                    # LLM 接口（base/qwen/factory + budget 预算/用量）
+│   │   ├── tool/                   # 工具系统（base/registry，含参数校验与工具子集隔离）
 │   │   ├── agent/                  # AgentGraph 状态图引擎
-│   │   ├── memory/                 # 记忆系统（消息/会话/画像 + 用户画像提炼）
+│   │   ├── memory/                 # 记忆系统（消息/会话/画像/提炼 + 增量合并 + 对账）
 │   │   └── config.py               # 全局配置（.env → Pydantic）
 │   │
-│   ├── agents/                     # Agent 实现
+│   ├── agents/                     # Agent 实现（supervisor 只做调度，人格/上下文收在各角色里）
+│   │   ├── supervisor.py           # 状态图组装 + 条件路由（intent → 4 条链路）
+│   │   ├── intent_classifier.py    # 意图分类（analysis/content/service/document）
+│   │   ├── planner.py              # 拆子任务（输出做结构校验，P2-13）
+│   │   ├── executor.py             # 子任务执行（tool_hint → 收窄工具集，P1-6）
+│   │   ├── synthesizer.py          # 综合各子任务结果 → 报告（流式 / 可选 viz 块）
 │   │   ├── data_analysis/simple_agent.py  # ReActAgent（核心循环）
-│   │   ├── content_gen/            # 内容 Agent（空壳）
-│   │   └── customer_service/       # 客服 Agent（空壳）
+│   │   ├── content_gen/            # 内容 Agent（文案/标题）
+│   │   ├── customer_service/       # 客服 Agent（查知识库）
+│   │   └── document/               # 文档 Agent（解析/优化/生成落盘）
 │   │
 │   ├── tools/                      # ★ 业务工具（三层注册）
 │   │   ├── data_tools/             # 5 个数据工具 + __init__ 注册
 │   │   ├── content_tools/          # 2 个内容工具（需注入 llm）+ __init__
-│   │   ├── service_tools/          # RAGTool + __init__
+│   │   ├── service_tools/          # RAGTool（按语料指纹缓存失效）+ __init__
+│   │   ├── document_tools/         # 解析/优化/写文档（落盘后回调推 SSE 事件）
 │   │   └── __init__.py             # register_all_tools() 总入口
 │   │
 │   ├── api/                        # FastAPI
-│   │   ├── app.py                  # 应用入口 + CORS
-│   │   ├── routes/chat.py          # /api/chat + /api/chat/stream
+│   │   ├── app.py                  # 应用入口 + lifespan（建表/记忆对账/提炼重放）+ CORS 白名单
+│   │   ├── routes/chat.py          # /api/chat + /api/chat/stream（SSE）+ 提炼后台任务
 │   │   ├── routes/auth.py          # 注册/登录（JWT）
 │   │   ├── routes/dashboard.py     # /api/dashboard + /api/dashboard/insight
 │   │   ├── routes/upload.py        # /api/upload 文件解析
 │   │   ├── routes/session.py       # /api/sessions 多会话 CRUD
+│   │   ├── routes/memory.py        # /api/memory 长期记忆查看/删除 + 提炼计数
+│   │   ├── routes/documents.py     # /api/documents 生成物列表/下载（归属校验）
 │   │   └── schemas/chat.py         # Pydantic 模型
 │   │
 │   ├── db/                         # 数据库
-│   │   ├── models/                 # Product/Order/User/ChatMessage/ChatSession/UserProfile/UploadedDoc
+│   │   ├── models/                 # Product/Order/User/ChatMessage/ChatSession/UserProfile/
+│   │   │                           #   UploadedDoc/LongTermMemory/InsightCache/MemoryExtractTask
 │   │   ├── session.py              # 异步引擎 + sessionmaker
 │   │   └── migrations/             # Alembic（空壳）
 │   │
 │   ├── infrastructure/
+│   │   ├── doc_output.py           # 生成物的落盘/归属路径解析（路径安全双保险）
 │   │   └── vector_store/           # ★ RAG 基础设施
 │   │       ├── embeddings.py       #   千问 embedding API
 │   │       ├── qdrant_client.py    #   Qdrant 本地模式
@@ -180,19 +201,24 @@ ecommerce-agent/
 │       ├── SessionSidebar.tsx      # 多会话列表
 │       ├── TracePanel.tsx          # 执行时间线
 │       ├── DashboardPage.tsx       # 数据看板 + AI 洞察
+│       ├── VizBlock.tsx            # 报告里的 ```viz 块 → 图表/表格
 │       ├── LoginPage.tsx           # 登录
-│       └── api.ts                  # API 封装（SSE/会话/洞察）
+│       └── api.ts                  # API 封装（SSE/会话/洞察/文档下载）
 │
 ├── scripts/
 │   ├── init_db.py                  # 建表
 │   ├── seed_data.py                # 模拟数据
 │   ├── build_kb.py                 # 知识库构建
 │   ├── cli.py                      # CLI 命令行
+│   ├── reconcile_memory.py         # 记忆对账（SQLite ↔ qdrant，支持 --dry-run）
 │   ├── smoke_*.py                  # 手工冒烟（真 LLM，非测试）
-│   └── rag_eval.py                 # RAG 检索评测（出数字）
+│   ├── verify_*.py                 # 单点验证脚本（工具参数/记忆增量/预算…）
+│   ├── rag_eval.py                 # RAG 检索评测（出数字）
+│   └── rag_quality_eval.py         # RAG 切分质量评测
 │
 ├── tests/                          # pytest 离线测试套件（假 LLM，无需 .env）
 │
+├── docs/                           # 章节文档（00/01/10/12/13 + 职业规划）
 ├── data_v3.db                      # SQLite 数据库文件
 ├── qdrant_data/                    # Qdrant 本地存储
 └── pyproject.toml                  # 项目配置
@@ -242,8 +268,8 @@ Agent 最大的缺点是黑盒。后端 SSE 事件（intent/plan/subtask/token/r
 用户输入 → API(/api/chat) → ReActAgent.run()
   └→ while 循环（最多 10 轮）:
        ├→ llm.chat(messages, tools=所有工具的JSON Schema)
-       ├→ LLM 返回: "我需要调 sales_query(start_date=...)"
-       ├→ registry.execute("sales_query", start_date=..., end_date=...)
+       ├→ LLM 返回: "我需要调 query_sales(start_date=...)"
+       ├→ registry.execute("query_sales", start_date=..., end_date=...)
        ├→ 结果喂回 messages
        └→ 再次 llm.chat() → 如果没 tool_calls 就结束
 ```
