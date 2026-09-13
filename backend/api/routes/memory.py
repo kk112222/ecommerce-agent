@@ -14,8 +14,14 @@ router = APIRouter()
 
 @router.get("/memory")
 async def list_memories(current_user: User = Depends(get_current_user)):
-    """列出当前用户生效中的长期记忆（语义画像 + 情景记忆，按时间倒序）"""
-    return {"memories": await list_long_term_memories(current_user.id)}
+    """列出当前用户生效中的长期记忆（语义画像 + 情景记忆，按时间倒序）
+
+    顺带带上提炼计数：记忆是后台任务，失败了用户只会觉得"它时好时坏"，
+    把 ok/skipped/failed/retried 暴露出来，至少能看见它到底跑没跑（P2-16）。
+    """
+    from backend.api.routes.chat import _EXTRACT_STATS
+    return {"memories": await list_long_term_memories(current_user.id),
+            "extract_stats": dict(_EXTRACT_STATS)}
 
 
 @router.delete("/memory/{mem_id}")

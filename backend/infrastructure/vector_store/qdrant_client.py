@@ -96,3 +96,18 @@ def delete_points(collection_name: str, point_ids: list[str]) -> None:
         return
     c = get_client()
     c.delete(collection_name=collection_name, points_selector=point_ids)
+
+
+def list_point_ids(collection_name: str = COLLECTION_NAME) -> set[str]:
+    """列出集合里全部点的 id（对账用：拿它和 SQLite 里登记的 pid 比对，找孤儿向量）"""
+    c = get_client()
+    if not c.collection_exists(collection_name):
+        return set()
+    ids: set[str] = set()
+    offset = None
+    while True:                                    # scroll 分页，一次 1000 条
+        points, offset = c.scroll(collection_name=collection_name, limit=1000,
+                                  offset=offset, with_payload=False, with_vectors=False)
+        ids.update(str(p.id) for p in points)
+        if offset is None:
+            return ids

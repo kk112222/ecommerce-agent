@@ -1,7 +1,9 @@
 import difflib
+import json
+import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from backend.core.llm.base import Message
 from backend.db.models.chat_message import ChatMessage
@@ -12,11 +14,13 @@ from backend.db.models.user_memory import LongTermMemory
 from backend.db.session import AsyncSessionLocal
 from backend.infrastructure.vector_store.embeddings import embed_text, embed_batch
 from backend.infrastructure.vector_store.qdrant_client import (
-    ensure_collection, upsert_docs, search_similar, delete_points,
+    ensure_collection, upsert_docs, search_similar, delete_points, list_point_ids,
 )
 from sqlalchemy import select, func, delete, update
 
 MEMORY_COLLECTION = "user_memories"  # 用户记忆的 qdrant collection（和知识库 kb_docs 分开）
+
+logger = logging.getLogger(__name__)
 
 
 async def save_message(sid: str, user_id: int, role: str, content: str) -> None:
@@ -88,6 +92,10 @@ async def update_user_profile(user_id:int,preferences:str) -> None:
 KIND_SEMANTIC = "semantic"    # 稳定画像：负责类目/关注 KPI/偏好
 KIND_EPISODIC = "episodic"    # 情景记忆：发生过的事/带时间的事实/新动向（可过期）
 
+# 情景记忆默认存活天数（P2-10）："上周做了什么"过一阵就不再影响判断，
+# 不设 TTL 的话它会无限堆积、长期污染召回。`_active_rows` 已经在读过期过滤，这里只管写。
+EPISODIC_TTL_DAYS = 30
+
 
 def _norm(s: str) -> str:
     """归一化：去空白 + 小写，让相似度比较不被空格/大小写干扰"""
@@ -105,6 +113,48 @@ def _ratio(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# 单轮"从缺席推断作废"的比例上限（P1-4 护栏）：超过就整批不作废
+RETIRE_GUARD_RATIO = 0.5
+# 低于这个条数时比例没有统计意义（1 条里作废 1 条永远是 100%），不套护栏
+RETIRE_GUARD_MIN_ROWS = 3
+
+_JUDGE_PROMPT = """下面每组是【已记住的旧偏好】和【本轮新出现的句子】，请逐组判断关系：
+- update：新句是旧句的**更新版**，同一件事变了、新句取代旧句（如"负责男装"→"负责女装"）
+- parallel：两句是**并列的不同事实**，都成立、互不取代（如"关注退货率"与"关注退款率"）
+
+只输出 JSON 字符串数组，长度与组数一致，元素只能是 "update" 或 "parallel"，不要任何解释。
+例如：["update","parallel"]
+
+{pairs}"""
+
+
+async def _judge_same_preference(llm, pairs: list[tuple[str, str]]) -> list[str] | None:
+    """让 LLM 判 0.45~0.9 歧义档：同一偏好的更新 vs 两条并列偏好
+
+    为什么非它不可：difflib 实测分不出这两类 ——
+    "负责男装类目 vs 负责女装类目"=0.833（真更新）、"关注退货率 vs 关注退款率"=0.800（并列），
+    字面相似度几乎一样，语义判定只能交给模型。判不了就返回 None，调用方降级回字面判据。
+    """
+    if llm is None or not pairs:
+        return None
+    block = "\n".join(
+        f"第{i + 1}组：\n旧：{old}\n新：{new}" for i, (new, old) in enumerate(pairs)
+    )
+    try:
+        resp = await llm.chat([Message(role="user", content=_JUDGE_PROMPT.format(pairs=block))],
+                              temperature=0.0)
+        raw = (resp.content or "").strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        verdicts = json.loads(raw)
+        if (isinstance(verdicts, list) and len(verdicts) == len(pairs)
+                and all(v in ("update", "parallel") for v in verdicts)):
+            return verdicts
+        logger.warning("记忆合并判定返回格式异常，降级回字面判据：%s", raw[:120])
+    except Exception:
+        logger.exception("记忆合并判定失败，降级回字面判据")
+    return None
 
 
 async def _embed_chunked(texts: list[str], size: int = 8) -> list[list[float]]:
@@ -144,25 +194,31 @@ async def _sync_profile_fallback(user_id: int) -> None:
 
 
 async def merge_semantic_memories(user_id: int, new_sentences: list[str],
-                                  source_session: str | None = None) -> dict:
+                                  source_session: str | None = None,
+                                  llm=None) -> dict:
     """增量合并语义画像（核心写路径，取代"删光重建"）
 
     把 LLM 输出的【当前全量画像】和库里生效中的旧画像逐条比对：
     - 相似度 ≥ 0.9   同一条偏好 → 只刷新热度（importance+1 / last_access）
-    - 0.45 ~ 0.9    同一偏好的"变化版"（如负责类目男装→女装）→ 作废旧行、按新文本重写
+    - 0.45 ~ 0.9    歧义档：交 LLM 判"同一偏好的更新"（作废旧行重写）还是"两条并列偏好"
+                    （旧行原样保留，两句都生效）—— 判不了/没给 llm 时降级回"当作更新"
     - < 0.45        全新偏好 → append
     - 旧行没被任何新句认领 = LLM 判定不再成立 → 作废（active=False，删其向量，保留行可审计）
+      但这条是**从缺席推断**的（LLM 少写一条、输出被截断都会触发），
+      所以加了比例护栏：未认领比例过高时整批不作废，宁可多留也不静默丢真记忆。
     """
     clean = [s.strip() for s in (new_sentences or []) if s and s.strip()]
     if not clean:
-        return {"added": 0, "changed": 0, "kept": 0, "retired": 0}
+        return {"added": 0, "changed": 0, "kept": 0, "retired": 0,
+                "parallel": 0, "guard": False}
     ensure_collection(MEMORY_COLLECTION)
 
     old = await _active_rows(user_id, KIND_SEMANTIC)
     used = [False] * len(old)          # 每条旧行最多被认领一次
     keep_ids, retire = [], []          # 刷新 / 作废（含被"变化版"替换的）
     add_texts: list[str] = []
-    n_new = n_changed = 0
+    n_new = n_changed = n_parallel = 0
+    fuzzy: list[tuple[str, int]] = []  # 歧义档：(新句, 旧行下标)，等 LLM 统一判定
 
     for s in clean:
         best_i, best_r = -1, 0.0
@@ -175,17 +231,34 @@ async def merge_semantic_memories(user_id: int, new_sentences: list[str],
         if best_i >= 0 and best_r >= 0.90:
             used[best_i] = True
             keep_ids.append(old[best_i].id)
-        elif best_i >= 0 and best_r >= 0.45:     # 同一偏好变了：作废旧版本，当新条目重写
-            used[best_i] = True
-            retire.append(old[best_i])
-            add_texts.append(s)
-            n_changed += 1
+        elif best_i >= 0 and best_r >= 0.45:
+            used[best_i] = True                  # 先占位，避免同一旧行被两条新句抢
+            fuzzy.append((s, best_i))
         else:
             add_texts.append(s)
             n_new += 1
-    for i, row in enumerate(old):                # 没被认领 = 判定不再成立 → 作废
-        if not used[i]:
-            retire.append(row)
+
+    # 歧义档一次 LLM 调用批量判定（省成本：整轮合并只多花一次调用）
+    if fuzzy:
+        verdicts = await _judge_same_preference(llm, [(s, old[i].text) for s, i in fuzzy])
+        for idx, (s, i) in enumerate(fuzzy):
+            if verdicts and verdicts[idx] == "parallel":
+                # 两条并列事实：旧行原样保留（不刷新热度），新句单独落一条
+                add_texts.append(s)
+                n_parallel += 1
+            else:
+                retire.append(old[i])            # 降级路径 = 原行为：当作同一偏好变了
+                add_texts.append(s)
+                n_changed += 1
+
+    unclaimed = [old[i] for i in range(len(old)) if not used[i]]
+    guard = len(old) >= RETIRE_GUARD_MIN_ROWS and len(unclaimed) > len(old) * RETIRE_GUARD_RATIO
+    if guard:
+        # 从缺席推断作废本来就不可靠，本轮大面积未认领更像是"LLM 输出不全"而不是"偏好都变了"
+        logger.warning("记忆合并护栏触发：%d/%d 条旧记忆未被本轮认领，本轮不作废（防静默丢记忆）",
+                       len(unclaimed), len(old))
+    else:
+        retire.extend(unclaimed)                 # 没被认领 = 判定不再成立 → 作废
 
     # ① 新文本向量化（API 失败留空 → 该行 qdrant_point_id=None，仍保留文本、可走画像兜底）
     vecs = await _embed_chunked(add_texts)
@@ -230,7 +303,8 @@ async def merge_semantic_memories(user_id: int, new_sentences: list[str],
         await db.commit()
 
     await _sync_profile_fallback(user_id)        # 兜底画像表跟随
-    return {"added": n_new, "changed": n_changed, "kept": len(keep_ids), "retired": len(retire)}
+    return {"added": n_new, "changed": n_changed, "kept": len(keep_ids),
+            "retired": len(retire), "parallel": n_parallel, "guard": guard}
 
 
 async def save_user_memories(user_id: int, sentences: list[str]) -> None:
@@ -239,8 +313,13 @@ async def save_user_memories(user_id: int, sentences: list[str]) -> None:
 
 
 async def save_episodic_memories(user_id: int, events: list[str],
-                                 source_session: str | None = None) -> int:
-    """情景记忆 append：和已有情景条相似的（≥0.85）去重跳过，否则落新行 + 向量"""
+                                 source_session: str | None = None,
+                                 ttl_days: int = EPISODIC_TTL_DAYS) -> int:
+    """情景记忆 append：和已有情景条相似的（≥0.85）去重跳过，否则落新行 + 向量
+
+    带 TTL（P2-10）：情景记忆是"有时效的事实"，过期后 `_active_rows` 自动不再返回它。
+    行还留在库里（可审计/可回溯），只是不再参与召回。
+    """
     clean = [e.strip() for e in (events or []) if e and e.strip()]
     if not clean:
         return 0
@@ -268,11 +347,12 @@ async def save_episodic_memories(user_id: int, events: list[str],
                                      "created_at": payload_ts, "kind": KIND_EPISODIC}})
     if docs:
         upsert_docs(docs, collection_name=MEMORY_COLLECTION)
+    expires = now + timedelta(days=ttl_days) if ttl_days else None
     async with AsyncSessionLocal() as db:
         for text, pid in rows:
             db.add(LongTermMemory(user_id=user_id, kind=KIND_EPISODIC, text=text,
                                   qdrant_point_id=pid, source_session=source_session,
-                                  created_at=now))
+                                  created_at=now, expires_at=expires))
         await db.commit()
     return len(rows)
 
@@ -281,7 +361,7 @@ async def recall_user_memories(user_id: int, query: str, top_k: int = 3) -> str:
     """按问题召回长期记忆（语义+情景一起），加权 = 相似度 × 重要性 × 新鲜度
 
     语义与情景都向量化进了同一 collection，向量召回天然能"语义命中"两类的文本；
-    命中不足时补最近几条（承接"刚才/上次说的"这类指代）；全空才退一句话画像兜底。
+    命中不足时补最近几条**语义**记忆（承接"刚才/上次说的"这类指代）；全空才退一句话画像兜底。
     """
     rows = await _active_rows(user_id)
     if not rows:
@@ -306,29 +386,34 @@ async def recall_user_memories(user_id: int, query: str, top_k: int = 3) -> str:
         scored.sort(key=lambda x: x[0], reverse=True)
         picked = [row for _, row in scored[:top_k]]
 
-    # 命中不足 → 补最近几条生效记忆（覆盖"刚才那个/上次"类提问）
+    # 命中不足 → 补最近几条生效的**语义**记忆（覆盖"刚才那个/上次"类提问）
+    # 只补 semantic（P2-9）：情景记忆是"当时发生了什么"，和当前问题的相关性无法靠"最近"推断，
+    # 塞进来只会污染 prompt —— 而且它本来就更该靠向量命中，不该靠兜底。
     if len(picked) < top_k:
-        recent = sorted(rows, key=lambda r: r.created_at or datetime.min, reverse=True)
+        recent = sorted((r for r in rows if r.kind == KIND_SEMANTIC),
+                        key=lambda r: r.created_at or datetime.min, reverse=True)
         for r in recent:
-            if all(r.id != p.id for p in picked):
-                picked.append(r)
             if len(picked) >= top_k:
                 break
+            if all(r.id != p.id for p in picked):
+                picked.append(r)
 
     if not picked:
         return await get_user_profile(user_id)
 
-    # 热度反馈：被召回的行 importance +1（封顶 10）+ 刷新 last_access（用得越多越靠前）
+    # 只刷新 last_access（管理界面展示"最近用过"），**不再动 importance**（P2-8）：
+    # 召回只说明"这条被搜到了"，不说明它重要。以前每召回一次就 +1 封顶 10，
+    # 聊十来轮后所有记忆都饱和成 10，"重要性"直接退化成噪声。
+    # importance 现在只在合并 keep 时涨（LLM 每轮重新确认它仍成立 = 真的稳定偏好）。
     async with AsyncSessionLocal() as db:
-        for row in picked[:top_k]:
+        for row in picked:
             r = await db.get(LongTermMemory, row.id)
             if r:
                 r.last_access_at = now
-                r.importance = min(10, (r.importance or 1) + 1)
         await db.commit()
 
     lines = []
-    for row in picked[:top_k]:
+    for row in picked:
         prefix = "（事件）" if row.kind == KIND_EPISODIC else ""
         lines.append(f"{prefix}{row.text}")
     return "\n".join(lines)
@@ -365,6 +450,72 @@ async def delete_long_term_memory(user_id: int, mem_id: int) -> bool:
     if kind == KIND_SEMANTIC:
         await _sync_profile_fallback(user_id)
     return True
+
+
+async def reconcile_memory(user_id: int | None = None, dry_run: bool = False) -> dict:
+    """SQLite ↔ qdrant 双向对账修复（P1-5）
+
+    背景：两个存储没有共享事务，写路径是"先动向量再提交 SQLite"，中途崩溃会留下两类不一致：
+    - 向量已删 / 没插上，而 DB 行还在 → 该行永远召不回（静默降级，不报错，最坑）
+    - 向量插上了，而 DB 提交失败 → 孤儿向量，白占空间且永远没人引用
+    两边顺序怎么调都堵不住（换顺序只是把故障从一类挪到另一类），
+    真正的出路是承认 SQLite 是唯一事实源，然后**定期拿事实源去校准索引**：
+
+    - 生效行缺少向量（pid 为空 / 点上不存在）→ 重新向量化补上（缺了就补，功能恢复）
+    - qdrant 里没有行引用的点 → 删掉（清理泄漏；dry_run 时只报告不删）
+
+    返回报告 dict，供启动日志 / 脚本打印。
+    """
+    ensure_collection(MEMORY_COLLECTION)
+    now = _utcnow()
+    async with AsyncSessionLocal() as db:
+        q = select(LongTermMemory).where(
+            LongTermMemory.active.is_(True),
+            (LongTermMemory.expires_at.is_(None)) | (LongTermMemory.expires_at > now),
+        )
+        if user_id is not None:
+            q = q.where(LongTermMemory.user_id == user_id)
+        rows = list((await db.execute(q)).scalars().all())
+
+    actual = list_point_ids(MEMORY_COLLECTION)
+    expected = {r.qdrant_point_id for r in rows if r.qdrant_point_id}
+
+    # ① 缺向量的生效行：重 embedding 补齐（补不了就留着，下次对账再试，绝不静默丢文本）
+    need_fix = [r for r in rows if not r.qdrant_point_id or r.qdrant_point_id not in actual]
+    repaired, failed = 0, 0
+    if need_fix:
+        vecs = await _embed_chunked([r.text for r in need_fix])
+        payload_ts = datetime.now().isoformat(timespec="seconds")
+        docs, pid_updates = [], []
+        for row, v in zip(need_fix, vecs):
+            if not v:
+                failed += 1
+                continue
+            pid = row.qdrant_point_id or str(uuid.uuid4())
+            docs.append({"id": pid, "vector": v,
+                         "payload": {"text": row.text, "user_id": row.user_id,
+                                     "created_at": payload_ts, "kind": row.kind}})
+            pid_updates.append((row.id, pid))
+        if docs and not dry_run:
+            upsert_docs(docs, collection_name=MEMORY_COLLECTION)
+            async with AsyncSessionLocal() as db:
+                for rid, pid in pid_updates:
+                    await db.execute(update(LongTermMemory)
+                                     .where(LongTermMemory.id == rid)
+                                     .values(qdrant_point_id=pid))
+                await db.commit()
+        repaired = len(docs)
+
+    # ② 孤儿向量：没有任何行引用的点 → 删（保留日志，出问题能追）
+    orphans = actual - expected
+    if orphans and not dry_run:
+        delete_points(MEMORY_COLLECTION, sorted(orphans))
+        logger.warning("记忆对账：清理 %d 个孤儿向量 %s", len(orphans), sorted(orphans)[:5])
+    if failed:
+        logger.warning("记忆对账：%d 条记忆向量化失败，文本仍保留在 SQLite，下次对账重试", failed)
+
+    return {"rows": len(rows), "repaired": repaired, "orphans": len(orphans),
+            "failed": failed, "dry_run": dry_run}
 
 
 async def save_uploaded_doc(session_id: str, user_id: int, filename: str, content: str) -> None:
