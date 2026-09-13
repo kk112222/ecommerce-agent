@@ -1,13 +1,13 @@
-from pathlib import Path
-
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-# 不管从哪个目录启动，都指向项目根目录的 data.db
-_db_path = Path(__file__).parent.parent.parent / "data_v3.db"  # backend/db → backend → 项目根
-DB_URL = f"sqlite+aiosqlite:///{_db_path.as_posix()}"
+from backend.core.config import settings
 
-# 1. 创建异步引擎
-engine = create_async_engine(DB_URL, echo=True)
+# 连接串来自配置（.env 的 DATABASE_URL，默认项目根 data_v3.db 的绝对路径）——
+# 以前这里硬编码，导致 settings.database_url 是个死字段、切 PostgreSQL 会静默失败
+DB_URL = settings.database_url
+
+# 1. 创建异步引擎（echo 跟着 debug 走：默认安静，排查时才开，免得日志刷满并泄业务数据）
+engine = create_async_engine(DB_URL, echo=settings.debug)
 
 # 2. 创建会话工厂
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
