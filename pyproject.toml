@@ -22,3 +22,15 @@ dependencies = [
     "sqlalchemy>=2.0.51",
     "uvicorn>=0.51.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]          # 只收 tests/ 下的用例（scripts/ 里的冒烟脚本不算测试）
+asyncio_mode = "auto"          # async 测试函数不用每个都加 @pytest.mark.asyncio
+pythonpath = ["."]             # 让 tests 里能 import backend.*（等价运行时的 PYTHONPATH=.）
+addopts = "-q"
