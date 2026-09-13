@@ -3,6 +3,18 @@ from typing import AsyncIterator
 
 from backend.core.llm.base import Message
 
+
+def _result_text(result) -> str:
+    """工具结果 → 喂给 LLM 的文本
+
+    失败时必须带上 error：否则 LLM 只看到 data（None），
+    不知道失败原因，下一轮没法自我纠正（参数传错也改不回来）。
+    """
+    if result.success:
+        return str(result.data)
+    return f"调用失败：{result.error}"
+
+
 class ReActAgent:
     """ReAct（Reasoning + Acting）循环 Agent —— LLM 自主决策调用多少次工具"""
 
@@ -31,7 +43,7 @@ class ReActAgent:
             for tc in response.tool_calls:
                 result = await self.registry.execute(tc.name, **tc.arguments)
                 messages.append(Message(
-                    role="tool", content=str(result.data), tool_call_id=tc.id,
+                    role="tool", content=_result_text(result), tool_call_id=tc.id,
                 ))
 
             # LLM 会自动从消息历史看到工具结果，不需要注入
@@ -65,13 +77,14 @@ class ReActAgent:
             for tc in response.tool_calls:
                 yield {"type": "status", "content": f"第{round_num + 1}步：调用 {tc.name}..."}
                 result = await self.registry.execute(tc.name, **tc.arguments)
+                text = _result_text(result)
                 yield {
                     "type": "tool_result",
                     "tool": tc.name,
-                    "data": str(result.data),
+                    "data": text,
                 }
                 messages.append(Message(
-                    role="tool", content=str(result.data), tool_call_id=tc.id,
+                    role="tool", content=text, tool_call_id=tc.id,
                 ))
 
         # 超最大轮数，强制总结
