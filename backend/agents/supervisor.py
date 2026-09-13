@@ -52,7 +52,10 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
     async def executor_node(state):
         plan = state["plan"]
         async def run_one(t):
-            r = await executor.run(t)
+            # 把上下文透传给子任务：以前只传 task，导致"结合上传数据做竞品对比"的子任务拿不到原料
+            r = await executor.run(t,
+                                   uploaded_data=state.get("uploaded_data", ""),
+                                   user_profile=state.get("user_profile", ""))
             if on_event:
                 await on_event({"type": "subtask", "id": t["id"], "task": t["task"], "result": r})
             return r
