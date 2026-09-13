@@ -7,6 +7,7 @@ def create_llm() -> BaseLLM:
         return QwenLLM(
             api_key=settings.dashscope_api_key,
             model=settings.llm_model,
+            verify_ssl=settings.llm_verify_ssl,
         )
     raise ValueError(f"不支持的 LLM provider: {settings.llm_provider}")
 

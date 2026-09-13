@@ -12,22 +12,15 @@ API 文档：https://help.aliyun.com/zh/model-studio/
 """
 import asyncio
 import json
+import logging
 from typing import Optional, AsyncIterator
 
 import requests
-# 临时方案：Windows 开发环境 SSL 证书问题，全局关闭验证
-# 上线前务必删除下面 3 行
 import urllib3
-urllib3.disable_warnings()
-_original_request = requests.Session.request
-
-def _patched_request(self, method, url, **kwargs):
-    kwargs["verify"] = False
-    return _original_request(self, method, url, **kwargs)
-
-requests.Session.request = _patched_request
 
 from .base import BaseLLM, Message, LLMResponse, ToolCall, TokenUsage
+
+logger = logging.getLogger(__name__)
 
 
 class QwenLLM(BaseLLM):
@@ -36,9 +29,14 @@ class QwenLLM(BaseLLM):
     # OpenAI 兼容端点：POST 一个 chat/completions 请求即可，返回标准 OpenAI 格式
     BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-    def __init__(self, api_key: str, model: str = "qwen3.7-plus"):
+    def __init__(self, api_key: str, model: str = "qwen3.7-plus", verify_ssl: bool = True):
         self.api_key = api_key
         self.model = model
+        # 只影响本客户端发出的请求，不碰 requests 全局行为（曾经的 monkey-patch 已移除）
+        self.verify_ssl = verify_ssl
+        if not verify_ssl:
+            logger.warning("LLM 请求已关闭 TLS 证书校验（verify_ssl=False），仅限本机调试，请勿带上线")
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     # ==================== 私有辅助方法 ====================
 
@@ -139,6 +137,7 @@ class QwenLLM(BaseLLM):
         def _sync_call() -> dict:
             resp = requests.post(
                 self.BASE_URL, headers=self._headers(), json=payload, timeout=(10, 300),
+                verify=self.verify_ssl,
             )
             if resp.status_code != 200:
                 # 不静默返回空：API 报错必须暴露，否则排查时一头雾水
@@ -176,7 +175,7 @@ class QwenLLM(BaseLLM):
             try:
                 resp = requests.post(
                     self.BASE_URL, headers=self._headers(), json=payload,
-                    stream=True, timeout=(10, 300),
+                    stream=True, timeout=(10, 300), verify=self.verify_ssl,
                 )
                 if resp.status_code != 200:
                     raise RuntimeError(
