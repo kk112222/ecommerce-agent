@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from backend.core.agent.base import AgentGraph
 from backend.core.llm.budget import BudgetExceeded
 from backend.agents.intent_classifier import IntentClassifier
@@ -9,6 +10,8 @@ from backend.agents.content_gen.content_agent import ContentAgent
 from backend.agents.customer_service.service_agent import ServiceAgent
 from backend.agents.document.document_agent import DocumentAgent
 
+logger = logging.getLogger("ecommerce-agent")   # 与 chat.py / 中间件同 logger，日志格式统一
+
 
 def _budget_note(e: BudgetExceeded) -> str:
     """预算用尽时的降级文案（P2-11）
@@ -17,6 +20,20 @@ def _budget_note(e: BudgetExceeded) -> str:
     而不是一个 500 或一句"分析失败"。文案里带上具体原因，前端/日志都能看出是被截断的。
     """
     return f"（本轮预算已用尽：{e.detail}；该步骤提前结束，以下内容是已完成部分）"
+
+
+def _fail_note(e: BaseException) -> str:
+    """单个子任务失败时的降级文案（异常隔离）
+
+    和 _budget_note 同一个思路，只是原因不是"没额度"而是"这一格炸了"：LLM 500/超时、
+    工具内部报错、任何非 BudgetExceeded 异常，都在这一格就地转成文案占位 ——
+    报告结构保持完整，synthesizer 还能把跑完的子任务综合出来（"一格失败不拖垮整轮"）。
+
+    以前 run_one 只接 BudgetExceeded，别的异常会穿过 gather 冒到 AgentGraph.invoke，
+    图直接中断、synthesize 永远不执行：另外三个子任务已经查好的数据全被丢掉，
+    用户看到的是"分析失败"。带上异常类型便于排查（日志里还有完整栈）。
+    """
+    return f"（该子任务失败：{type(e).__name__}: {str(e)[:200]}）"
 
 
 def _fallback_report(state) -> str:
@@ -90,11 +107,21 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
                 # 一个子任务把额度吃光了，不能连累其余三个：这一格用降级文案占位，
                 # 报告结构保持完整，synthesizer 还能把跑完的部分综合出来
                 r = _budget_note(e)
+            except Exception as e:
+                # 非预算异常同样只报销这一格（LLM 500/超时、工具内部报错…）。
+                # 降级不等于免责：必须留日志，否则"偶发 500"只剩报告里一句软话，没人查得到
+                logger.exception("子任务执行失败：%s", t.get("id"))
+                r = _fail_note(e)
             if on_event:
                 await on_event({"type": "subtask", "id": t["id"], "task": t["task"], "result": r})
             return r
-        results_list = await asyncio.gather(*[run_one(t) for t in plan])
-        state["results"] = {t["id"]: r for t, r in zip(plan, results_list)}
+        # return_exceptions=True：run_one 没接住的（例如 on_event 自己抛了）也不许冒到图外面，
+        # 否则 synthesize 直接不执行 —— 上面那格降级就白做了
+        results_list = await asyncio.gather(*[run_one(t) for t in plan], return_exceptions=True)
+        state["results"] = {
+            t["id"]: (r if not isinstance(r, BaseException) else _fail_note(r))
+            for t, r in zip(plan, results_list)
+        }
         return state
 
     async def synthesize_node(state):

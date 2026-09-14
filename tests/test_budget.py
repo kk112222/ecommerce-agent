@@ -5,7 +5,10 @@ P2-11：ReAct 循环调几次工具由 LLM 自决，最坏 40+ 次调用，成�
 ① 账本记得准（有 usage 用真值，流式没 usage 就估算并标记）
 ② 到上限后不再发起新调用
 ③ 超预算时图必须"降级出报告"，不是抛 500 让用户看空白
+④ 子任务的**非预算**异常（LLM 500/超时/工具内部报错）同样只降级那一格，不拖垮整轮
 """
+import json
+
 import pytest
 
 from backend.agents.supervisor import build_supervisor
@@ -49,6 +52,26 @@ class _BlockAfter(FakeLLM):
         self._guard()          # 异步生成器：首次迭代时才跑，正好在 synthesize 的 async for 里抛出
         async for chunk in super().chat_stream(messages, tools=tools, temperature=temperature):
             yield chunk
+
+
+class _FailOnTask(FakeLLM):
+    """遇到指定子任务的调用就抛非预算异常 —— 模拟 LLM 500 / 超时 / 工具内部报错
+
+    按 messages 内容判断，而不是"第几次调用"：子任务在 gather 里是并发的，
+    靠调用序号归因会随调度顺序漂移。标记词只出现在那一个子任务的 prompt 里。
+    """
+
+    def __init__(self, script, fail_when: str, exc: Exception | None = None):
+        super().__init__(script)
+        self.fail_when = fail_when
+        self.exc = exc or RuntimeError("模拟 DashScope 500")
+        self.failed = 0
+
+    async def chat(self, messages, tools=None, temperature=0.7) -> LLMResponse:
+        if any(self.fail_when in str(getattr(m, "content", "")) for m in messages):
+            self.failed += 1
+            raise self.exc
+        return await super().chat(messages, tools=tools, temperature=temperature)
 
 
 class _StreamBlocked(FakeLLM):
@@ -140,6 +163,30 @@ async def test_executor_subtasks_degrade_instead_of_crash():
     assert all("预算" in v for v in final["results"].values())
     assert final["report"].strip()                        # 有报告，不是空串
     assert "预算" in final["report"]
+
+
+async def test_non_budget_exception_is_isolated_to_its_subtask():
+    """回归：一个子任务抛非预算异常，不能让整轮失败、把其余子任务的结果一起丢掉
+
+    gather 默认把第一个异常立刻抛给调用方，异常穿过 executor_node → AgentGraph.invoke
+    直接中断 → synthesize 永远不执行 → 用户看到"分析失败"，而另外的子任务其实已经查好了。
+    （用 faulthandler / event loop 实测过：gather 并不会取消兄弟协程，它们照样跑完，
+      只是返回值被丢弃、token 白烧 —— 所以这里既验证"不崩"，也验证"结果保住了"。）
+    """
+    plan = json.dumps([{"id": "t1", "task": "查本周销售额"},
+                       {"id": "t2", "task": "查库存（注入失败）"}], ensure_ascii=False)
+    llm = _FailOnTask([INTENT, plan, "销售环比上升 12%", "库存积压 300 件"],
+                      fail_when="注入失败")
+    final = await _graph(llm).invoke({"goal": "这周为什么掉量"})
+
+    assert llm.failed == 1, "标记词没命中，这条测试没测到隔离逻辑"
+    assert set(final["results"]) == {"t1", "t2"}                 # 报告结构完整，没丢项
+    assert final["results"]["t1"] == "销售环比上升 12%"           # 跑成功的那格必须保住
+    assert "失败" in final["results"]["t2"] and "RuntimeError" in final["results"]["t2"]
+    assert final["report"].strip()                               # 综合报告照样产出
+    # 保住的结果要真的喂进综合报告（不是只躺在 state 里）：能流式的是最后一个调用
+    synth_prompt = " ".join(str(getattr(m, "content", "")) for m in llm.calls[-1])
+    assert "销售环比上升 12%" in synth_prompt and "失败" in synth_prompt
 
 
 async def test_synthesizer_fallback_keeps_subtask_results():
