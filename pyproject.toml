@@ -1,7 +1,7 @@
 [project]
 name = "ecommerce-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "掌柜 —— 电商运营团队的 AI 助手（查数分析 / 文案生成 / 售后问答 / 文档处理）"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",

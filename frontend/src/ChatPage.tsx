@@ -1,87 +1,40 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import {
-  Input, Button, Card, Typography, Space, Tag, message, Upload,
-} from 'antd';
-import {
-  SendOutlined, RobotOutlined, UserOutlined,
-  UploadOutlined, FileTextOutlined, ProfileOutlined, ToolOutlined, DownloadOutlined,
-} from '@ant-design/icons';
+import { Upload, message } from 'antd';
+import { ArrowUpOutlined, PaperClipOutlined, FileOutlined } from '@ant-design/icons';
 import {
   sendMessageStream, uploadFile, fetchSessionMessages,
   fetchMyDocuments, downloadDocument,
-  type StreamEvent, type PlanItem, type UploadResult, type GeneratedDocument, type LlmUsage,
+  type StreamEvent, type UploadResult, type GeneratedDocument, type LlmUsage,
 } from './api';
 import TracePanel, { type TraceStep } from './TracePanel';
 import ReactMarkdown from 'react-markdown';
 import VizBlock, { parseViz } from './VizBlock';
+import { INTENT_DOT, INTENT_LABEL } from './theme';
 
-const { Text, Title } = Typography;
-const { TextArea } = Input;
+/** 空态示例：点一下就填进输入框（比一句"我是你的助手"有用） */
+const HINTS = [
+  '这周营业额为什么低，怎么提高销量',
+  '哪些商品库存快没了，需要补货',
+  '给苹果15写三条淘宝标题，关键词 超薄、快充',
+  '退货要多久？运费谁出？',
+  '把这份周报精简成要点并存成 md',
+];
 
-// ============ PostHog 视觉语言 → 局部样式常量 ============
-// （主题色在 App.tsx 的 ConfigProvider 里统一定义，这里只放组件局部要用的）
-const C = {
-  bg: '#15131c',          // 页面底
-  surface: '#1e1a28',     // 卡片表面
-  surface2: '#262233',    // 次级表面（子任务卡片）
-  border: '#332d45',
-  borderSoft: '#2a2539',
-  accent: '#F54E00',      // 珊瑚橙主色
-  accentText: '#1a1723',  // 橙底上的深色文字
-  yellow: '#FFE14D',      // PostHog 荧光黄（辅助强调）
-  text: '#ece9f2',
-  textSec: '#a6a0b8',
-  textWeak: '#7a748c',
-  mono: "'JetBrains Mono','Source Code Pro',Consolas,monospace",
-};
-
-// 意图 → 显示文案 + 强调色（supervisor 条件边分类结果；图标用 SVG，不堆 emoji）
-const intentLabels: Record<string, string> = {
-  analysis: '数据分析',
-  content: '内容生成',
-  service: '客服问答',
-  document: '文档处理',
-};
-const intentColor: Record<string, string> = {
-  analysis: '#ff7a3d',
-  content: '#e8c92f',
-  service: '#9a8cff',
-  document: '#4fd1c5',
-};
-
-// markdown 渲染样式：深色主题适配，标题用 antd 排版
-const mdComponents = {
-  h1: ({ node: _n, ...props }: any) => <Title level={4} style={{ marginTop: 12, marginBottom: 8, color: C.text }} {...props} />,
-  h2: ({ node: _n, ...props }: any) => <Title level={5} style={{ marginTop: 12, marginBottom: 8, color: C.text }} {...props} />,
-  h3: ({ node: _n, ...props }: any) => <Title level={5} style={{ marginTop: 10, marginBottom: 6, color: C.text }} {...props} />,
-  p: ({ node: _n, ...props }: any) => <p style={{ margin: '4px 0' }} {...props} />,
-  ul: ({ node: _n, ...props }: any) => <ul style={{ margin: '4px 0', paddingLeft: 20 }} {...props} />,
-  ol: ({ node: _n, ...props }: any) => <ol style={{ margin: '4px 0', paddingLeft: 20 }} {...props} />,
-  li: ({ node: _n, ...props }: any) => <li style={{ margin: '2px 0' }} {...props} />,
-  blockquote: ({ node: _n, ...props }: any) => (
-    <blockquote style={{ margin: '4px 0', paddingLeft: 12, borderLeft: '3px solid #332d45', color: C.textSec }} {...props} />
-  ),
-  a: ({ node: _n, ...props }: any) => <a style={{ color: '#ff7a3d' }} {...props} />,
-  strong: ({ node: _n, ...props }: any) => <strong style={{ color: C.text }} {...props} />,
-};
-
-/** 助手消息渲染：普通 markdown + 识别末尾 ```viz 块渲染成图表/表格。
+/** 助手消息渲染：markdown 正文 + 末尾 ```viz 块渲染成图表/表格
  * 流式中块没闭合 → 正文照常打字机，图表区显示占位；report 完整后自动替换成真图 */
 function MarkdownViz({ content }: { content: string }) {
   const { body, viz, incomplete } = parseViz(content);
   return (
-    <>
-      <ReactMarkdown components={mdComponents}>{body}</ReactMarkdown>
+    <div className="prose">
+      <ReactMarkdown>{body}</ReactMarkdown>
       {viz !== null && <VizBlock raw={viz} incomplete={incomplete} />}
-    </>
+    </div>
   );
 }
 
 interface ChatMsg {
-  role: 'user' | 'assistant' | 'plan' | 'subtask';
+  role: 'user' | 'assistant';
   content: string;
-  plan?: PlanItem[];
-  subtaskId?: string;
 }
 
 interface ChatPageProps {
@@ -101,10 +54,19 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
   const [docs, setDocs] = useState<GeneratedDocument[]>([]);      // 本会话已生成的文件（可下载）
   const [usage, setUsage] = useState<LlmUsage | null>(null);      // 上一轮的 LLM 用量（P2-11）
   const listRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [messages, steps]);
+
+  // 输入框随内容长高（最多 160px，超过内部滚动）—— 不引第三方 autosize
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
 
   // 挂载时若带初始会话 id（从侧边栏切进来的历史会话），拉取历史消息填充
   useEffect(() => {
@@ -132,7 +94,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
     return () => { alive = false; };
   }, [sessionId]);
 
-  // 追加/覆盖最后一个 assistant 气泡（报告打字机累积用）
+  // 追加/覆盖最后一个 assistant 消息（报告打字机累积用）
   const appendAssistant = useCallback((content: string, replace = false) => {
     setMessages(prev => {
       const copy = [...prev];
@@ -147,7 +109,6 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
   }, []);
 
   // 上传前确保有一个会话 ID：上传的文件挂在这个会话下，聊天时 Agent 才能读到
-  // 新对话还没 sid 时现场生成一个，并上报 App（高亮 + 刷新列表）
   const ensureSessionId = () => {
     if (!sessionId) {
       const id = Math.random().toString(36).slice(2, 10);
@@ -190,7 +151,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
         switch (event.type) {
           case 'intent':
             setIntent(event.intent);
-            finishStep('intent', { label: `识别意图 · ${intentLabels[event.intent] ?? event.intent}` });
+            finishStep('intent', { label: `识别意图 · ${INTENT_LABEL[event.intent] ?? event.intent}` });
             // 只有"数据分析"链路才有拆解计划 + 子任务阶段；
             // 内容生成/客服问答是 ReAct 直接出结果，只推 report，不能加 plan 步骤（否则永远转圈）
             if (event.intent === 'analysis') {
@@ -293,192 +254,154 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
     }
   }
 
+  // 活动流排在"正在生成的回答"之前（Codex 的观感：先看它干了什么，再看结论）。
+  // 纯展示层重排，不动任何状态逻辑：最后一条若是 assistant，就把它拎出来放到时间线后面。
+  const lastIsAssistant = messages.length > 0 && messages[messages.length - 1].role === 'assistant';
+  const leading = lastIsAssistant ? messages.slice(0, -1) : messages;
+  const trailing = lastIsAssistant ? messages.slice(-1) : [];
+
+  const renderMsg = (msg: ChatMsg, i: number, streaming: boolean) => (
+    msg.role === 'user' ? (
+      <div className="turn-user" key={i}>
+        <span className="mark">›</span>
+        <div className="body">{msg.content}</div>
+      </div>
+    ) : (
+      <div className="turn-ai" key={i}>
+        <div className="role">
+          <span>assistant</span>
+          {streaming && <span className="caret" />}
+        </div>
+        <MarkdownViz content={msg.content} />
+      </div>
+    )
+  );
+
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', height: '100dvh', display: 'flex', flexDirection: 'column', background: C.bg }}>
-      {/* ============ 顶部标题栏 ============ */}
-      <Card size="small" style={{ borderRadius: 0, borderTop: 0, borderBottom: `1px solid ${C.borderSoft}`, background: C.surface }}
-        styles={{ body: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 24px' } }}>
-        <Space size={12}>
-          <Title level={5} style={{ margin: 0, fontSize: 15, color: C.text }}>智能问答</Title>
-          {intent && (
-            <Tag style={{ background: 'rgba(245,78,0,0.14)', color: intentColor[intent], borderColor: 'rgba(245,78,0,0.4)', margin: 0 }}>
-              {intentLabels[intent]}
-            </Tag>
-          )}
-          {sessionId && (
-            <Tag style={{ background: 'transparent', borderColor: C.border, color: C.textSec, margin: 0 }}>会话 {sessionId}</Tag>
-          )}
-        </Space>
-      </Card>
-
-      {/* ============ 消息列表 ============ */}
-      <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', background: C.bg }}>
-        {messages.length === 0 && (
-          <div style={{ textAlign: 'center', marginTop: 64, color: C.textWeak }}>
-            <RobotOutlined style={{ fontSize: 44, marginBottom: 16, color: C.accent }} />
-            <br />
-            <Text style={{ color: C.textSec, fontSize: 15 }}>
-              我是你的电商运营助手
-            </Text>
-            <br />
-            <Text style={{ color: C.textWeak, fontSize: 13 }}>
-              查销售 ｜ 库存预警 ｜ 会员分析 ｜ 文案生成 ｜ 上传数据做竞品对比
-            </Text>
-          </div>
+    <div className="chat">
+      {/* 顶部：极细的一行元信息（意图 / 会话 id 用等宽字体） */}
+      <div className="chat-head">
+        <span className="title">智能问答</span>
+        {intent && (
+          <span className="chip">
+            <span className="chip-dot" style={{ background: INTENT_DOT[intent] ?? 'var(--text-3)' }} />
+            {INTENT_LABEL[intent] ?? intent}
+          </span>
         )}
-
-        {messages.map((msg, i) => {
-          if (msg.role === 'plan') {
-            return (
-              <div key={i} style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
-                <Card size="small" style={{ width: '82%', background: C.surface, borderColor: C.borderSoft, borderLeft: `3px solid ${C.accent}` }}
-                  styles={{ body: { padding: '12px 16px' } }}>
-                  <Text strong style={{ color: C.text, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <ProfileOutlined style={{ color: C.accent }} /> 执行计划
-                  </Text>
-                  {msg.plan?.map((p, idx) => (
-                    <div key={p.id} style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                      <Tag color="orange" style={{ margin: 0 }}>{idx + 1}</Tag>
-                      <Text style={{ fontSize: 13, color: C.textSec }}>{p.task}</Text>
-                    </div>
-                  ))}
-                </Card>
-              </div>
-            );
-          }
-          if (msg.role === 'subtask') {
-            return (
-              <div key={i} style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 8 }}>
-                <div style={{ maxWidth: '82%', width: '100%' }}>
-                  <div style={{
-                    padding: '10px 14px', borderRadius: 10, background: C.surface2,
-                    border: `1px solid ${C.border}`, fontSize: 13, color: '#c8b9ff',
-                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                  }}>
-                    <Text style={{ fontSize: 11, color: C.textWeak, display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <ToolOutlined style={{ fontSize: 11 }} /> 子任务 {msg.subtaskId} 结果
-                    </Text>
-                    <br />
-                    {msg.content}
-                  </div>
-                </div>
-              </div>
-            );
-          }
-          return (
-            <div key={i} style={{
-              display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 16,
-            }}>
-              <div style={{ display: 'flex', maxWidth: '78%', gap: 8, alignItems: 'flex-start' }}>
-                {msg.role === 'assistant' && <RobotOutlined style={{ fontSize: 18, color: C.accent, marginTop: 10 }} />}
-                {msg.role === 'user' ? (
-                  // 用户消息：珊瑚橙底深字（PostHog 风格）
-                  <div style={{
-                    padding: '10px 16px', borderRadius: 12,
-                    background: C.accent, color: C.accentText,
-                    whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.8, fontWeight: 500,
-                  }}>
-                    {msg.content}
-                  </div>
-                ) : (
-                  // 助手消息：深色表面 + 细边框，markdown 渲染
-                  <div style={{
-                    padding: '12px 16px', borderRadius: 12,
-                    background: C.surface, color: C.text, wordBreak: 'break-word', lineHeight: 1.8,
-                    border: `1px solid ${C.borderSoft}`, flex: 1,
-                  }}>
-                    <MarkdownViz content={msg.content} />
-                  </div>
-                )}
-                {msg.role === 'user' && <UserOutlined style={{ fontSize: 18, color: C.textSec, marginTop: 10 }} />}
-              </div>
-            </div>
-          );
-        })}
-
-        {/* 生成的文档：Agent 落盘后立刻出现在这里，点一下就能下载（P0-3 闭环的那一半） */}
-        {docs.length > 0 && (
-          <Card size="small" style={{ marginTop: 12, background: C.surface, borderColor: C.borderSoft, borderLeft: '3px solid #4fd1c5' }}
-            styles={{ body: { padding: '10px 16px' } }}>
-            <Text strong style={{ fontSize: 13, color: C.text, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <FileTextOutlined style={{ color: '#4fd1c5' }} /> 本次生成的文件
-            </Text>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
-              {docs.map(d => (
-                <Button key={d.path} size="small" icon={<DownloadOutlined />}
-                  onClick={() => handleDownload(d)}
-                  style={{ fontWeight: 500 }}>
-                  {d.filename}（{(d.bytes / 1024).toFixed(1)} KB）
-                </Button>
-              ))}
-            </div>
-          </Card>
-        )}
-
-        {/* 本次提问的执行时间线：意图→计划→子任务→报告 */}
-        {steps.length > 0 && <TracePanel steps={steps} />}
-
-        {/* 本轮 LLM 用量（P2-11）：一行小字，不抢报告主视觉，但成本和延迟不再是黑盒 */}
-        {usage && (
-          <div style={{
-            marginTop: 8, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
-            fontFamily: C.mono, fontSize: 11.5, color: usage.exhausted ? C.accent : C.textWeak,
-          }}>
-            <span>本轮 LLM</span>
-            <span>{usage.calls} 次调用</span>
-            <span>·</span>
-            <span>{usage.total_tokens.toLocaleString()} tokens</span>
-            <span>·</span>
-            <span>{(usage.elapsed_ms / 1000).toFixed(1)}s</span>
-            {usage.estimated_calls > 0 && <span>（{usage.estimated_calls} 次为估算）</span>}
-            {usage.exhausted && (
-              <span style={{ color: C.accent }}>
-                已触及{usage.exhausted === 'tokens' ? ' token' : '时间'}上限，报告被截断
-              </span>
-            )}
-          </div>
+        {sessionId && <span className="chip">session {sessionId}</span>}
+        <span style={{ flex: 1 }} />
+        {loading && (
+          <span className="chip" style={{ border: 'none', background: 'transparent' }}>
+            <span className="chip-dot" style={{ background: 'var(--warn)', animation: 'blink 1.2s steps(2) infinite' }} />
+            运行中
+          </span>
         )}
       </div>
 
-      {/* ============ 底部：上传区 + 输入区 ============ */}
-      <Card size="small" style={{ borderRadius: 0, borderBottom: 0, borderTop: `1px solid ${C.borderSoft}`, background: C.surface }}
-        styles={{ body: { padding: '10px 24px 12px' } }}>
-        {/* 上传数据条：CSV/PDF/MD，Agent 提问时注入做竞品对比 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
-          <Upload
-            accept=".csv,.tsv,.md,.pdf,.docx,.html,.htm"
-            showUploadList={false}
-            beforeUpload={(file) => { handleUpload(file as File); return false; }}
-          >
-            <Button size="small" icon={<UploadOutlined />} loading={uploading} style={{ fontWeight: 500 }}>
-              上传数据
-            </Button>
-          </Upload>
-          <Text style={{ fontSize: 12, color: C.textWeak }}>CSV / PDF / MD（≤10MB），供竞品对比分析</Text>
-          {uploaded.map(u => (
-            <Tag
-              key={u.filename}
-              icon={<FileTextOutlined />}
-              closable
-              onClose={() => setUploaded(prev => prev.filter(x => x !== u))}
-              style={{ background: 'rgba(255,225,77,0.1)', color: C.yellow, borderColor: 'rgba(255,225,77,0.35)', fontSize: 12 }}
-            >
-              {u.filename}
-            </Tag>
-          ))}
-        </div>
+      {/* 消息流 */}
+      <div className="chat-body" ref={listRef}>
+        <div className="stream">
+          {messages.length === 0 && (
+            <div className="empty">
+              <h1>掌柜</h1>
+              <p>电商运营 AI 助手 · 查数分析 / 文案生成 / 售后问答 / 文档处理</p>
+              <div className="empty-hints">
+                {HINTS.map(h => (
+                  <div className="empty-hint" key={h} onClick={() => setInput(h)}>
+                    <span className="k">›</span>
+                    <span>{h}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
-        <Space.Compact style={{ width: '100%' }}>
-          <TextArea value={input} onChange={e => setInput(e.target.value)}
-            onKeyDown={handleKeyDown} placeholder="输入问题，Enter 发送..."
-            autoSize={{ minRows: 1, maxRows: 4 }} disabled={loading}
-            style={{ resize: 'none' }} />
-          <Button type="primary" icon={<SendOutlined />}
-            onClick={handleSend} loading={loading} style={{ height: 'auto' }}>
-            发送
-          </Button>
-        </Space.Compact>
-      </Card>
+          {leading.map((m, i) => renderMsg(m, i, false))}
+
+          {/* 执行时间线：本次提问的 Agent 活动（活动 → 结论 的顺序） */}
+          {steps.length > 0 && <TracePanel steps={steps} />}
+
+          {trailing.map((m, i) => renderMsg(m, leading.length + i, loading))}
+
+          {/* 生成的文件：Agent 落盘后立刻出现，点一行就能下载 */}
+          {docs.length > 0 && (
+            <div className="docs">
+              <div className="docs-head">生成的文件</div>
+              {docs.map(d => (
+                <div className="doc-row" key={d.path} onClick={() => handleDownload(d)}>
+                  <FileOutlined style={{ fontSize: 12 }} />
+                  <span>{d.filename}</span>
+                  <span className="size">{(d.bytes / 1024).toFixed(1)} KB ↓</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 本轮 LLM 用量：一行等宽小字，成本和延迟不再是黑盒 */}
+          {usage && (
+            <div className="usage">
+              <span>usage</span>
+              <span>{usage.calls} calls</span>
+              <span className="sep">·</span>
+              <span>{usage.total_tokens.toLocaleString()} tokens</span>
+              <span className="sep">·</span>
+              <span>{(usage.elapsed_ms / 1000).toFixed(1)}s</span>
+              {usage.estimated_calls > 0 && <span>（{usage.estimated_calls} 次估算）</span>}
+              {usage.exhausted && (
+                <span style={{ color: 'var(--warn)' }}>
+                  已触及{usage.exhausted === 'tokens' ? ' token' : '时间'}上限，报告被截断
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 底部输入区：一个框 + 一行工具提示，没有多余的卡片 */}
+      <div className="composer">
+        <div className="composer-inner">
+          <div className="composer-box">
+            <textarea
+              ref={taRef}
+              rows={1}
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={loading ? '生成中…' : '问点什么 — Enter 发送，Shift+Enter 换行'}
+              disabled={loading}
+            />
+            <button
+              className="send-btn"
+              onClick={handleSend}
+              disabled={loading || !input.trim()}
+              title="发送"
+            >
+              <ArrowUpOutlined />
+            </button>
+          </div>
+          <div className="composer-bar">
+            <Upload
+              accept=".csv,.tsv,.md,.pdf,.docx,.html,.htm"
+              showUploadList={false}
+              beforeUpload={(file) => { handleUpload(file as File); return false; }}
+            >
+              <span className="tool" style={{ opacity: uploading ? 0.5 : 1 }}>
+                <PaperClipOutlined /> 上传数据
+              </span>
+            </Upload>
+            {uploaded.map(u => (
+              <span
+                className="tool pip" key={u.filename} title={`${u.chars} 字符，点击移除`}
+                onClick={() => setUploaded(prev => prev.filter(x => x !== u))}
+              >
+                {u.filename} ×
+              </span>
+            ))}
+            <span className="spacer" />
+            <span>CSV / PDF / MD ≤ 10MB，供竞品对比分析</span>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

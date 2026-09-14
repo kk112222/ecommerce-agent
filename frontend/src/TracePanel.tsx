@@ -1,37 +1,4 @@
-import { Spin, Typography } from 'antd';
-import { CloseOutlined, ToolOutlined } from '@ant-design/icons';
 import type { PlanItem } from './api';
-
-const { Text } = Typography;
-
-/** 闪电图标（PostHog 珊瑚橙渐变 SVG，替代 emoji） */
-function BoltIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden>
-      <defs>
-        <linearGradient id="trace-bolt-grad" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor="#ff8a4d" />
-          <stop offset="100%" stopColor="#F54E00" />
-        </linearGradient>
-      </defs>
-      <path d="M13 2 L4.5 13.5 H10.5 L9 22 L19.5 10 H13.5 Z" fill="url(#trace-bolt-grad)" />
-    </svg>
-  );
-}
-
-// PostHog 深色视觉：执行时间线的颜色常量
-const C = {
-  surface: '#1e1a28',
-  border: '#332d45',
-  borderSoft: '#2a2539',
-  accent: '#F54E00',
-  text: '#ece9f2',
-  textSec: '#a6a0b8',
-  textWeak: '#7a748c',
-  ok: '#7fd15c',
-  err: '#ff5a5f',
-  mono: "'JetBrains Mono','Source Code Pro',Consolas,monospace",
-};
 
 export type StepKind = 'intent' | 'plan' | 'subtask' | 'report';
 export type StepStatus = 'pending' | 'running' | 'done' | 'error';
@@ -49,61 +16,56 @@ export interface TraceStep {
   result?: string;      // subtask 步骤携带：该子任务的执行结果摘要
 }
 
-/** 耗时格式化：<1s 显示 ms，≥1s 显示 x.xs */
+/** 耗时格式化：<1s 显示 ms，≥1s 显示 x.xs（等宽字体保证竖排对齐） */
 function fmtMs(ms: number): string {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
-/** 单行步骤：左侧状态节点 + 标签 + 右侧耗时 + 详情 */
-function TraceRow({ s }: { s: TraceStep }) {
-  const node = s.status === 'running' ? (
-    <Spin size="small" />
-  ) : s.status === 'done' ? (
-    <span style={{
-      width: 10, height: 10, borderRadius: '50%', background: C.ok,
-      display: 'inline-block',
-    }} />
-  ) : s.status === 'error' ? (
-    <CloseOutlined style={{ color: C.err, fontSize: 12 }} />
-  ) : (
-    <span style={{ width: 10, height: 10, borderRadius: '50%', background: C.textWeak, display: 'inline-block' }} />
-  );
+/** 状态字形：running ◐（闪烁）/ done ✓ / error ✗ / pending ·（Codex 的 activity 就是这种极简记号） */
+function glyph(status: StepStatus) {
+  if (status === 'done') return { ch: '✓', color: 'var(--ok)' };
+  if (status === 'error') return { ch: '✗', color: 'var(--err)' };
+  if (status === 'running') return { ch: '◐', color: 'var(--text)' };
+  return { ch: '·', color: 'var(--text-3)' };
+}
 
+/** 单行步骤：状态字形 + 标签 + 耗时，详情（计划/工具/结果）折在下面 */
+function TraceRow({ s }: { s: TraceStep }) {
+  const g = glyph(s.status);
   return (
-    <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
-      <div style={{ width: 20, height: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-        {node}
+    <div className={`trace-row ${s.status}`}>
+      <div
+        className="trace-node"
+        style={{ color: g.color, animation: s.status === 'running' ? 'blink 1.2s steps(2) infinite' : undefined }}
+      >
+        {g.ch}
       </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'baseline' }}>
-          <Text style={{
-            fontSize: 13, fontWeight: 500,
-            color: s.status === 'running' ? C.text : s.status === 'done' ? C.textSec : s.status === 'error' ? C.err : C.textWeak,
-          }}>{s.label}</Text>
-          {s.costMs != null && (
-            <Text style={{ fontSize: 11, color: C.textWeak, fontFamily: C.mono, flexShrink: 0 }}>{fmtMs(s.costMs)}</Text>
-          )}
+      <div className="trace-main">
+        <div className="trace-line">
+          <span className="trace-label">{s.label}</span>
+          {s.costMs != null && <span className="trace-cost">{fmtMs(s.costMs)}</span>}
         </div>
-        {/* plan 步骤：展开子任务列表 */}
+        {/* plan 步骤：把拆出来的子任务和它们的工具提示摊开 */}
         {s.kind === 'plan' && s.plan && (
-          <div style={{ marginTop: 4, paddingLeft: 2 }}>
+          <ul className="act-list">
             {s.plan.map((p, i) => (
-              <div key={p.id} style={{ fontSize: 12, color: C.textSec, lineHeight: 1.7 }}>{i + 1}. {p.task}</div>
+              <li key={p.id}>
+                <span className="idx">{i + 1}</span>
+                <span>{p.task}</span>
+                {p.tool_hint && <span className="hint">{p.tool_hint}</span>}
+              </li>
             ))}
-          </div>
+          </ul>
         )}
-        {/* subtask 步骤：工具提示 + 结果摘要 */}
+        {/* subtask 步骤：工具名 + 结果摘要（结果折叠，避免长文本淹没时间线） */}
         {s.kind === 'subtask' && (s.toolHint || s.result) && (
-          <div style={{ marginTop: 4, paddingLeft: 2 }}>
-            {s.toolHint && (
-              <Text style={{ fontSize: 11, color: C.textWeak, display: 'flex', alignItems: 'center', gap: 4 }}>
-                <ToolOutlined style={{ fontSize: 11 }} /> {s.toolHint}
-              </Text>
-            )}
+          <div className="trace-sub">
+            {s.toolHint && <div className="k">{s.toolHint}</div>}
             {s.result && (
-              <div style={{ fontSize: 12, color: C.textSec, whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
-                {s.result}
-              </div>
+              <details className="act-out">
+                <summary>查看结果</summary>
+                <pre>{s.result}</pre>
+              </details>
             )}
           </div>
         )}
@@ -112,29 +74,18 @@ function TraceRow({ s }: { s: TraceStep }) {
   );
 }
 
-/** 执行时间线：一次提问的 Agent 执行过程（意图→计划→子任务→报告） */
+/** 执行时间线：一次提问的 Agent 执行过程（意图 → 计划 → 子任务 → 报告） */
 export default function TracePanel({ steps }: { steps: TraceStep[] }) {
   if (steps.length === 0) return null;
+  const done = steps.filter(s => s.status === 'done').length;
   return (
-    <div style={{
-      margin: '4px auto 16px', width: '82%', borderRadius: 10,
-      background: C.surface, border: `1px solid ${C.borderSoft}`,
-      borderLeft: `3px solid ${C.accent}`, padding: '12px 14px 12px 18px',
-    }}>
-      <Text style={{ fontSize: 12, color: C.textWeak, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
-        <BoltIcon /> 执行过程
-      </Text>
-      {/* 相对定位容器 + 绝对定位竖线（左 10px 处穿过节点圆心），形成时间线 */}
-      <div style={{ position: 'relative', marginTop: 10, paddingLeft: 2 }}>
-        {steps.length > 1 && (
-          <div style={{
-            position: 'absolute', left: 10, top: 10, bottom: 4, width: 2,
-            background: C.borderSoft,
-          }} />
-        )}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {steps.map(s => <TraceRow key={s.id} s={s} />)}
-        </div>
+    <div className="trace">
+      <div className="trace-head">
+        <span>AGENT ACTIVITY</span>
+        <span>{done}/{steps.length}</span>
+      </div>
+      <div className="trace-body">
+        {steps.map(s => <TraceRow key={s.id} s={s} />)}
       </div>
     </div>
   );

@@ -1,9 +1,7 @@
 import { useState } from 'react';
-import { Card, Form, Input, Button, Tabs, Typography, message, Space } from 'antd';
-import { RobotOutlined, LockOutlined, UserOutlined, IdcardOutlined } from '@ant-design/icons';
+import { Form, Input, Button, Tabs, message } from 'antd';
+import { LockOutlined, UserOutlined, IdcardOutlined } from '@ant-design/icons';
 import { login, register } from './auth';
-
-const { Title, Text } = Typography;
 
 interface LoginPageProps {
   onSuccess: () => void;
@@ -42,18 +40,14 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
   return (
     <div style={{
       height: '100dvh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'radial-gradient(1200px 600px at 20% 0%, rgba(245,78,0,0.08) 0%, transparent 60%), linear-gradient(135deg, #15131c 0%, #1e1a28 100%)',
+      // 一点极淡的顶部高光 + 近黑底（不再是橘紫渐变）：登录页和主界面同一套语言
+      background: 'radial-gradient(900px 420px at 50% -10%, rgba(255,255,255,0.045) 0%, transparent 62%), var(--bg)',
     }}>
-      <Card style={{ width: 380, boxShadow: '0 12px 40px rgba(0,0,0,0.4)', borderColor: '#332d45' }}>
-        <div style={{ textAlign: 'center', marginBottom: 24 }}>
-          <div style={{
-            width: 56, height: 56, borderRadius: 14, margin: '0 auto',
-            background: '#F54E00', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
-            <RobotOutlined style={{ fontSize: 28, color: '#1a1723' }} />
-          </div>
-          <Title level={4} style={{ margin: '14px 0 4px', color: '#ece9f2' }}>电商运营 AI Agent</Title>
-          <Text style={{ color: '#a6a0b8' }}>运营人员的智能副驾</Text>
+      <div className="login-card">
+        <div style={{ textAlign: 'center', marginBottom: 20 }}>
+          <div className="login-logo">掌</div>
+          <div className="login-name">掌柜</div>
+          <div className="login-sub">电商运营 AI 助手 · 内部运营团队</div>
         </div>
 
         <Tabs
@@ -104,12 +98,8 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
           ]}
         />
 
-        <Space style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            测试账号：zhangsan / admin123
-          </Text>
-        </Space>
-      </Card>
+        <div className="login-tip">测试账号 zhangsan / admin123</div>
+      </div>
     </div>
   );
 }

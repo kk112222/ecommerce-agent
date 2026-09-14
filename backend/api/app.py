@@ -53,7 +53,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="电商运营 AI Agent", lifespan=lifespan)
+app = FastAPI(title="掌柜 · 电商运营 AI 助手 API", lifespan=lifespan)
 
 # ===== 中间件（注册顺序 = 从内到外的包裹顺序）=====
 
