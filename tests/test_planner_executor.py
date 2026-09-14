@@ -4,8 +4,11 @@
 - Planner：LLM 给的 JSON 形状千奇百怪，以前只判 isinstance(list)，id 重复会把两条子任务结果
   折叠成一条（静默丢结果），缺 task 直接 KeyError 崩掉整轮。
 - Executor：tool_hint 是死字段、4 个并行子任务各揣全部工具；uploaded_data 没传进去。
+  后续取舍：hint 的硬隔离是**单工具**——一个子任务只填一个工具，需要多个工具就拆成多条子任务。
+  填了多个工具名不算"更灵活"，会退化成放开全集（隔离静默失效），所以下面钉了回归用例。
 """
 import json
+import logging
 
 import pytest
 
@@ -99,6 +102,40 @@ def test_missing_task_dropped_and_fabricated_hint_cleared():
     assert plan == [{"id": "t1", "task": "查销售额", "tool_hint": ""}]
 
 
+def test_plan_prompt_hardens_single_tool_rule():
+    """回归：tool_hint 的"单工具"必须是硬规则，不能写回"尽量匹配一个"
+
+    executor 是按单工具硬隔离的（registry 只留那一个工具），prompt 用"尽量"这种软措辞时，
+    planner 一旦给一条子任务填两个工具，它就只有第一个工具可用 → 静默给出残缺结论
+    （"为什么销量跌"查了销售、没查库存，报告看上去还挺像回事）。这条用例是 prompt-only
+    改动的唯一自动防线：规则被改软了就得有人发现。
+    """
+    llm = _RecordingLLM([LLMResponse(content="[]")])
+    _run(Planner(llm, _registry()).plan("这周为什么掉量"))
+
+    prompt = llm.last_messages[0].content
+    assert "只允许填一个工具名" in prompt
+    assert "拆成多条子任务" in prompt
+
+
+def test_multi_tool_hint_is_cleared_and_logged(caplog):
+    """回归：一条子任务填多个工具名 → 清空 + 告警（不能静默）
+
+    清空是对的方向：executor 只认单个合法工具名，多工具名落到它手里会"放开全集"，
+    隔离失效却没有任何异常——比"只给一个工具"更难发现。但清空本身也是降级，
+    必须留痕，否则 planner 违反硬规则的频次永远看不见。
+    """
+    with caplog.at_level(logging.WARNING, logger="ecommerce-agent"):
+        plan = _plan([
+            {"id": "t1", "task": "为什么销量跌", "tool_hint": "query_sales,check_stock"},
+            {"id": "t2", "task": "查竞品价格", "tool_hint": "query_sales"},
+        ])
+
+    assert plan[0]["tool_hint"] == ""               # 多工具 hint 清空
+    assert plan[1]["tool_hint"] == "query_sales"    # 单个合法工具名照旧生效，别误伤
+    assert any("tool_hint 不是单一合法工具名" in r.getMessage() for r in caplog.records)
+
+
 def test_plan_is_capped():
     """prompt 要求 2~5 条，LLM 给 9 条 → 截断，别把成本放大到失控"""
     plan = _plan([{"id": f"t{i}", "task": f"子任务{i}", "tool_hint": ""} for i in range(1, 10)])
@@ -123,6 +160,21 @@ def test_executor_opens_full_toolset_without_hint():
     ex = Executor(llm, _registry())
     _run(ex.run({"id": "t1", "task": "随便看看", "tool_hint": ""}))
     assert len(llm.tools_seen[0]) == len(_registry().tools)
+
+
+def test_executor_logs_multi_tool_hint_fallback(caplog):
+    """回归：executor 侧遇到多工具 hint 会静默放开全集 → 至少得留日志
+
+    planner 那条路已经堵住了（清空 + 告警），这里是兜底：别的调用方直接把 hint 传进来时，
+    "放开全集"是刻意保留的行为（宁可不隔离，也不能让子任务啥也调不动），但不能是无声的。
+    """
+    llm = _RecordingLLM()
+    ex = Executor(llm, _registry())
+    with caplog.at_level(logging.WARNING, logger="ecommerce-agent"):
+        _run(ex.run({"id": "t1", "task": "为什么销量跌", "tool_hint": "query_sales,check_stock"}))
+
+    assert len(llm.tools_seen[0]) == len(_registry().tools)     # 放开全集，不是只给一个工具
+    assert any("放开全集" in r.getMessage() for r in caplog.records)
 
 
 def test_executor_injects_uploaded_data():

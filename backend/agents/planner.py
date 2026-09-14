@@ -1,6 +1,10 @@
 import json
+import logging
 import re
 from backend.core.llm.base import Message
+
+logger = logging.getLogger("ecommerce-agent")   # 与 chat.py / supervisor.py 同 logger，日志格式统一
+
 
 class Planner:
     def __init__(self,llm,registry):
@@ -20,8 +24,10 @@ class Planner:
 
         【硬规则】
         1. 把目标拆成 2~5 个互相独立的子任务，每个子任务必须能独立完成，不能依赖其他子任务的输出
-        2. 每个子任务尽量匹配一个最合适的工具名填在 tool_hint；不确定就留空字符串
-        3. 只输出一个 JSON 数组，不要任何解释、不要 markdown 代码块、不要多余文字
+        2. tool_hint **只允许填一个工具名**，不许出现逗号、多个工具名或任何其它文字；判断不出用哪个就留空字符串
+        3. 一条子任务只干一件事：如果某个子任务需要用到多个工具，必须把它拆成多条子任务，每条只对应一个工具。
+           拆开不会变慢（子任务是并行的），但"一条子任务塞两个工具"会让它只拿到第一个工具、给出残缺结论
+        4. 只输出一个 JSON 数组，不要任何解释、不要 markdown 代码块、不要多余文字
 
         【输出格式】
         [
@@ -55,7 +61,12 @@ class Planner:
         LLM 会输出各种不合法形状：不是 list、缺 task、id 重复/缺失、tool_hint 编造工具名。
         以前只判了 isinstance(list)，下游 `state["results"] = {t["id"]: r for t, r in zip(plan, ...)}`
         一旦 id 重复就会把两条子任务的结果折叠成一条（静默丢结果），缺 task 直接 KeyError。
-        这里逐条补齐 + 去重 + 校验，保证：id 唯一、task 非空、tool_hint 只可能是真工具名或空。
+        这里逐条补齐 + 去重 + 校验，保证：id 唯一、task 非空、tool_hint 只可能是**单个**真工具名或空。
+
+        为什么 tool_hint 必须卡成"单个"：executor 是单工具硬隔离（registry 收窄成那一个工具），
+        hint 只要不是单一合法工具名就退化成"放开全集" —— 看着没报错，实际是隔离静默失效、
+        四个并行子任务又各揣全部工具。所以清空的同时必须留痕，否则 planner 违反硬规则 2 的
+        频次永远看不见（历史教训：静默降级 = 没人查得到）。
         """
         bad = (not isinstance(plan, list)) or not plan
         if not bad:
@@ -84,8 +95,13 @@ class Planner:
                 tid = f"t{n}"
             seen_ids.add(tid)
             hint = str(item.get("tool_hint") or "").strip()
+            if hint and hint not in self.registry.tools:
+                # 命中两种情况：编造的工具名（子任务会去调一个不存在的工具）、
+                # 以及"一条子任务填了多个工具"（executor 只认单一工具名，会静默放开全集）
+                logger.warning("planner 的 tool_hint 不是单一合法工具名，已清空：%r（子任务 %s）", hint, tid)
+                hint = ""
             cleaned.append({
                 "id": tid, "task": task_text,
-                "tool_hint": hint if hint in self.registry.tools else "",   # 编造的工具名要清掉
+                "tool_hint": hint,
             })
         return cleaned or [{"id": "t1", "task": goal, "tool_hint": ""}]

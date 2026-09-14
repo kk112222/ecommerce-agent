@@ -1,7 +1,11 @@
 
+import logging
 from datetime import datetime
 from backend.core.llm.base import Message
 from backend.agents.data_analysis.simple_agent import ReActAgent
+
+logger = logging.getLogger("ecommerce-agent")   # 与 chat.py / planner.py 同 logger
+
 
 class Executor:
     def __init__(self,llm,registry):
@@ -14,11 +18,19 @@ class Executor:
           手里根本没有竞品数据（文档链路能拿到，分析链路拿不到，是断链）
         - tool_hint：以前是死字段（只用了 task['task']）→ 现在据此把注册中心收窄成子集，
           4 个并行子任务不再各自揣着全部工具、靠 prompt 软约束互相越界
+
+        隔离的边界是**单个**工具：hint 不是单个合法工具名就放开全集。这是有意的取舍
+        （宁可不隔离，也不能把子任务锁死成啥也干不了），但它是静默的，所以留日志。
+        多工具子任务不该靠放宽 hint 解决 —— planner 的硬规则 2/3 要求拆成多条子任务。
         """
         # ① 构造"子任务专属"system prompt
         today = datetime.now().strftime("%Y-%m-%d")  # 算今天
         hint = (task.get("tool_hint") or "").strip()
         allowed = hint if hint in self.registry.tools else ""     # hint 无效/为空 → 放开全集
+        if hint and not allowed:
+            # planner 那边已经会清空非法 hint 并告警，走到这里说明是别的调用方直接给的
+            logger.warning("tool_hint 不是单个合法工具名，本子任务放开全集：%r（子任务 %s）",
+                           hint, task.get("id"))
         system_prompt = f"""你是数据分析子任务执行者,今天是{today}。你被分配了一个明确的子任务，只完成它，不要跑题。
 
         【你的子任务】
