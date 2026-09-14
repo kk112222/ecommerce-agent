@@ -72,6 +72,24 @@ def test_duplicate_ids_are_renumbered():
     assert len(set(ids)) == 2 and len(plan) == 2
 
 
+def test_duplicate_id_whose_replacement_is_taken_terminates():
+    """回归：替换候选名也被占用时必须继续往前找，不能原地自旋
+
+    上面的 [t1, t1] 恰好让候选 t2 空着，一次就过 —— 触发条件是"重复的那条 id，
+    它算出来的替换候选也已经在 seen_ids 里"，例如 [t1, t3, t3]（LLM 完全可能这么给）。
+    老写法 `tid = f"t{len(seen_ids) + 1}"` 在循环体内 len() 恒定 → 候选名固定 →
+    死循环 + 同步 CPU 自旋，堵的不是一个请求而是整个事件循环（faulthandler 已实锤）。
+    """
+    plan = _plan([
+        {"id": "t1", "task": "查销售额", "tool_hint": "query_sales"},
+        {"id": "t3", "task": "查库存", "tool_hint": "check_stock"},
+        {"id": "t3", "task": "查竞品", "tool_hint": ""},
+    ])
+    ids = [p["id"] for p in plan]
+    assert len(plan) == 3, "三条子任务都要留下，不能丢项"
+    assert len(set(ids)) == 3, f"id 必须唯一（会折叠下游 results），实际 {ids}"
+
+
 def test_missing_task_dropped_and_fabricated_hint_cleared():
     """缺 task 的条目丢弃；编造的工具名清空（否则子任务会去调一个不存在的工具）"""
     plan = _plan([

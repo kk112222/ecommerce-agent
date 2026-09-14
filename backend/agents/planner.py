@@ -75,9 +75,13 @@ class Planner:
                 continue
             tid = str(item.get("id") or "").strip() or f"t{i + 1}"
             if tid in seen_ids:                      # id 重复 → 重编，避免结果被折叠
-                tid = f"t{len(cleaned) + 1}"
-                while tid in seen_ids:
-                    tid = f"t{len(seen_ids) + 1}"
+                # 候选名必须每次循环都往前推：seen_ids 只在循环外 add，写成
+                # `while tid in seen_ids: tid = f"t{len(seen_ids) + 1}"` 的话 len() 是常量，
+                # 候选名固定不变 → 一旦被占就原地自旋，同步 CPU 跑在请求路径上会堵死整个事件循环
+                n = len(seen_ids) + 1
+                while f"t{n}" in seen_ids:
+                    n += 1
+                tid = f"t{n}"
             seen_ids.add(tid)
             hint = str(item.get("tool_hint") or "").strip()
             cleaned.append({

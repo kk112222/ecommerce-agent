@@ -107,7 +107,7 @@
 - **长期记忆收尾 ✅（09-13）**：difflib 分不出"关注退货率 vs 关注退款率"这类平行偏好 → 0.45~0.90 歧义档交 LLM 判"更新 vs 并列"，判据坏了自动退回旧行为；"从未被认领"的作废加 50%/3 行护栏（避免单轮把画像清空）；召回不再灌 importance（热度 `last_access_at` 与语义权重 `importance` 分离）；episodic 加 30 天 TTL；SQLite↔qdrant 无共享事务 → `reconcile_memory()` 双向对账（补丢的向量/清孤儿点，`--dry-run` 可用）挂在 lifespan
 - **提炼任务可靠性 ✅（09-13）**：`create_task` 返回值持强引用（否则任务可能被 GC，"记忆时好时坏"）；per-user 锁换 `WeakValueDictionary`（原来只增不减）；失败落 `memory_extract_tasks` 表 + 启动重放 + `/api/memory` 暴露 ok/skipped/failed/retried 计数
 - **LLM 预算与用量 ✅（09-13）**：`BudgetedLLM` 装饰器包住 BaseLLM —— 预算必须在 LLM 层，因为调用次数是 ReAct 循环内部攒的（4×executor×≤10 轮），Graph 节点看不见。超限由 supervisor 各节点降级（保数据出报告）而非抛 500；用量随 `/chat` 响应与 SSE `usage` 事件上前端。真机实测：45 字回答实际消耗 805 completion tokens（思考 token 不体现在可见输出里）
-- **配置与健壮性 ✅（09-13）**：CORS 白名单取代 `*`、`lifespan` 取代弃用的 `on_event`、`.env` 里 DB_URL/密钥/echo 真正生效（原来配了不用）；planner 输出结构校验（兜底 id `tl`→`t1`、id 去重、缺 task 丢弃、编造工具名清空、上限 5 条）；executor 按 `tool_hint` 把 registry 收窄成子集（硬隔离，不再靠 prompt 软约束）；registry 按 spec 做类型校验 + 兜住工具本体异常；KB 按**语料内容指纹**失效缓存（重建知识库不用重启）。测试从 5 个文件扩到 14 个（103 项，全离线）
+- **配置与健壮性 ✅（09-13）**：CORS 白名单取代 `*`、`lifespan` 取代弃用的 `on_event`、`.env` 里 DB_URL/密钥/echo 真正生效（原来配了不用）；planner 输出结构校验（兜底 id `tl`→`t1`、id 去重、缺 task 丢弃、编造工具名清空、上限 5 条）；executor 按 `tool_hint` 把 registry 收窄成子集（硬隔离，不再靠 prompt 软约束）；registry 按 spec 做类型校验 + 兜住工具本体异常；KB 按**语料内容指纹**失效缓存（重建知识库不用重启）。测试从 5 个文件扩到 14 个（104 项，全离线）
 
 ### 尚未完成 ❌
 
