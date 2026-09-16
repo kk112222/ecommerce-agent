@@ -50,6 +50,22 @@ def _coerce(prop: dict, value):
     return True, value, ""          # 没声明/未知类型：不拦
 
 
+# ==================== 能力范围（角色级工具白名单） ====================
+# 为什么按"角色"而不是"单条子任务"划能力边界（2026-09-16 调整，替代原来的 subset([单个 hint])）：
+# - 子任务的语义是"回答一个问题"，它天然可能要用多个工具（查销售 → 发现跌 → 再查库存）；
+#   按子任务锁成单工具时，planner 拆得不够细就会**静默给出残缺结论**（不报错、报告看着还挺完整）。
+# - 业界做法是把能力边界绑在**角色/agent 类型**上（例如"只读规划者""只读代码浏览者"这类
+#   类型级白名单），每个角色拿到"它这个角色所需的最小工具集合"，角色内部自由选择工具。
+# - 跨角色越界依然被挡住：分析子任务想调 write_document 写文件，schema 里根本没这个工具。
+# 降级原则：范围名为空 / 工具没注册 → 放开全集（宁可不隔离，也不能把子任务锁死），但要留告警。
+TOOL_SCOPES: dict[str, list[str]] = {
+    "analysis": ["query_sales", "category_query", "check_stock", "user_profile", "product_query"],
+    "content": ["title_optimizer", "copy_generator"],
+    "service": ["search_knowledge_base"],
+    "document": ["optimize_document", "write_document"],
+}
+
+
 class ToolRegistry:
     """统一管理所有工具"""
     def __init__(self):
@@ -63,8 +79,22 @@ class ToolRegistry:
         """按名字取出工具"""
         return self.tools[name]
 
+    def subset_scope(self, scope: str) -> "ToolRegistry":
+        """按**角色范围**取子集（TOOL_SCOPES）—— 子任务的能力边界按角色划，不按单条子任务划
+
+        与 subset() 的关系：subset() 是"给我这几个名字"，subset_scope() 是"给我这个角色的能力范围"。
+        """
+        names = TOOL_SCOPES.get(scope) or []
+        sub = self.subset(names)
+        if not sub.tools:
+            # 范围名写错 / 工具没注册：放开全集，但绝不能不吭声（静默降级 = 没人查得到）
+            logger.warning("工具范围 %r 为空或工具未注册，本次放开全集（%d 个工具）",
+                           scope, len(self.tools))
+            return self
+        return sub
+
     def subset(self, names) -> "ToolRegistry":
-        """只含指定工具的新注册中心（按 tool_hint 给子任务隔离职责）
+        """只含指定工具的新注册中心（底层能力：由代码显式指定名字）
 
         比"prompt 里叮嘱它只用某个工具"硬：子任务拿到的注册中心里根本没有别的工具，
         既看不到别的工具说明书，也调不动。names 里不存在的工具名直接忽略。

@@ -263,7 +263,7 @@ class ScriptedLLM(BaseLLM):
         if "任务规划器" in system:
             return LLMResponse(content=self._plan_json())
         if "子任务执行者" in system:
-            m = re.search(r"本子任务请使用 (\w+)", system)
+            m = re.search(r"建议优先使用】(\w+)", system)
             if not is_tool_result and m and m.group(1) in _TOOL_ARGS:
                 return self._tool_call(m.group(1))
             return LLMResponse(content=self._conclusion())
@@ -436,8 +436,15 @@ async def main() -> None:
     if s["failed"]:
         print(f"\n另有 {s['failed']} 条整体失败（指标只按跑成功的 {s['ran']} 条算）")
 
+    # 显式关闭 qdrant 客户端：本地模式是单进程锁，靠解释器析构释放会留下"已被占用"的坑
+    try:
+        from backend.infrastructure.vector_store.qdrant_client import get_client
+        get_client().close()
+    except Exception:
+        pass
+
     shutil.rmtree(EVAL_OUTPUTS, ignore_errors=True)
-    print("\n怎么读：② 召回率低 = 拆解/工具选择漏了必要维度；④ 低 = planner 没守单工具契约；"
+    print("\n怎么读：② 召回率低 = 拆解/工具选择漏了必要维度；④ 低 = planner 没给有效的首选工具提示；"
           "\n⑤ 低 = 报告在编数（编排层幻觉）。改 prompt 前后各跑一次，对比同一份金标集。")
 
 
