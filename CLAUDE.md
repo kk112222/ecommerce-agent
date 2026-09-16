@@ -110,6 +110,10 @@
 - **配置与健壮性 ✅（09-13）**：CORS 白名单取代 `*`、`lifespan` 取代弃用的 `on_event`、`.env` 里 DB_URL/密钥/echo 真正生效（原来配了不用）；planner 输出结构校验（兜底 id `tl`→`t1`、id 去重、缺 task 丢弃、编造工具名清空、上限 5 条）；executor 按 `tool_hint` 把 registry 收窄成子集（硬隔离，不再靠 prompt 软约束；粒度是**单工具** —— 需要多个工具的子任务靠"拆成多条"解决，不是靠放宽 hint）；registry 按 spec 做类型校验 + 兜住工具本体异常；KB 按**语料内容指纹**失效缓存（重建知识库不用重启）。测试从 5 个文件扩到 15 个（108 项，全离线）
 - **修复轮后自查出并处理掉 3 条 ✅（09-14，docs/13 第十节）**：① planner id 重编号死循环（`len()` 在循环体内是常量 → 同步 CPU 自旋，堵的是整个事件循环，faulthandler 实锤）；② `executor_node` 的裸 `asyncio.gather` 没有异常隔离 —— 任一子任务抛非预算异常（LLM 500/超时）都会中断整轮、丢掉其余子任务已查好的结果，现在 `run_one` 逐格降级 + `return_exceptions=True` 兜底；③ `tool_hint` 单工具硬隔离"收得太紧" —— 需要两个工具的子任务会静默给出残缺结论，而填了多个工具名又会被清空、放开全集（守规矩的被削、不守规矩的放开），现在把 planner 规则**硬化**成"一条子任务一个工具，需要多个就拆条" + 降级路径补 warning。三条都补了回归用例，且都**先验证过用例在修复前会失败**
 
+### 增补（09-16，工具边界从「子任务级」上移到「角色级」）
+
+- **角色级工具范围 ✅（09-16，591ce3e）**：原来 executor 按 planner 的 tool_hint 把注册中心收窄成**单个工具** —— 粒度绑错层：子任务是「执行实例」不是「职责单元」，planner 拆解不准时会**静默给出残缺结论**（守规矩的被削、不守规矩的反因 hint 非法而放开全集）。现在 registry 加 `TOOL_SCOPES` + `subset_scope()`：executor 固定拿 analysis 角色的 5 个数据工具；tool_hint 降级为 prompt 里「建议优先使用」的提示；**跨角色越界（分析任务想写文件）仍被 schema 挡住**。planner 硬规则改为「按要回答的问题拆、不按工具拆」。测试 14 项（角色范围 / 同角色连续调两个工具 / 跨角色拦截 / 未知范围降级告警），全量 110 项无失败。
+
 ### 尚未完成 ❌
 
 - Docker Compose 部署（后端/前端/数据库一键起）
@@ -149,7 +153,7 @@ ecommerce-agent/
 │   │   ├── supervisor.py           # 状态图组装 + 条件路由（intent → 4 条链路）
 │   │   ├── intent_classifier.py    # 意图分类（analysis/content/service/document）
 │   │   ├── planner.py              # 拆子任务（输出做结构校验，P2-13）
-│   │   ├── executor.py             # 子任务执行（tool_hint → 收窄工具集，P1-6）
+│   │   ├── executor.py             # 子任务执行（按角色收窄工具集 subset_scope；tool_hint 只是提示）
 │   │   ├── synthesizer.py          # 综合各子任务结果 → 报告（流式 / 可选 viz 块）
 │   │   ├── data_analysis/simple_agent.py  # ReActAgent（核心循环）
 │   │   ├── content_gen/            # 内容 Agent（文案/标题）
