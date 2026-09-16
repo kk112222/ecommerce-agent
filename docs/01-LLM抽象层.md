@@ -135,87 +135,137 @@ class BaseLLM(ABC):
 
 ## 五、具体实现：QwenLLM 对接 DashScope
 
-抽象定好了，接下来写真正的"干活"代码 —— `backend/core/llm/qwen.py` 里的 `QwenLLM`。
+抽象定好了，接下来写真正"干活"的代码 —— `backend/core/llm/qwen.py` 里的 `QwenLLM`。
 
-它要做三件事：**把自己的格式翻译成千问的**，**调 API**，**再把千问的返回翻译回来**。
+**先说一段踩坑后改掉的实现**（面试很值得讲）：最早用的是 dashscope SDK 的 `Generation.call`。后来想升级到 qwen3.7 系列新模型，结果**全部返回空**，SDK 报 `400 url error`，一度以为是模型名写错了。真相是：**dashscope SDK 走的是旧端点，不认新模型** —— qwen3.7 系列只挂在 **OpenAI 兼容端点**（`compatible-mode/v1/chat/completions`）上。同一个模型名，两个端点一个 200 一个 400。
 
-### 5.1 格式转换：我们的 Message → 千问的字典
+所以现在改成 **requests 直连 OpenAI 兼容端点**。这不只是为了调新模型：**OpenAI 兼容格式是业界事实标准**，以后换 DeepSeek / 智谱，改 `BASE_URL` + `model` 就行。
+
+它要做三件事：**把我们的格式翻译成 OpenAI 格式**，**发请求**，**再把返回翻译回来**。
+
+### 5.1 格式转换：我们的 Message → OpenAI 格式字典
 
 ```python
 def _to_qwen_messages(self, messages: list[Message]) -> list[dict]:
-    """把我们的 Message 转成千问 API 需要的字典"""
+    """把我们的 Message 转成 OpenAI 兼容格式字典
+
+    注意要带上 tool_calls / tool_call_id —— ReAct 循环里
+    assistant 的 tool_calls 和 tool 结果必须关联，否则 LLM 看不懂工具反馈
+    """
     result = []
     for msg in messages:
-        result.append({"role": msg.role, "content": msg.content})
+        item = {"role": msg.role, "content": msg.content}
+        if msg.tool_call_id:                       # tool 消息：回应的是哪次调用
+            item["tool_call_id"] = msg.tool_call_id
+        if msg.tool_calls:                         # assistant 消息：要调哪些工具
+            item["tool_calls"] = [{
+                "id": tc.id, "type": "function",
+                "function": {"name": tc.name,
+                             "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+            } for tc in msg.tool_calls]
+        result.append(item)
     return result
 ```
 
-我们的 `Message` 是 pydantic 对象，千问要的是纯字典。做个薄薄的转换即可。
+> 比"我们的 `Message` 有 4 个字段、对面只要 2 个"时复杂：**OpenAI 协议要求"请求调用"和"结果返回"成对出现**，所以 `tool_calls` 和 `tool_call_id` 一个都不能丢（丢了 API 直接 400）。第 04 章讲 ReAct 循环时会再遇到它。
 
-### 5.2 响应解析：千问的返回 → 统一的 LLMResponse
-
-千问返回结构很深（`response.output.choices[0].message`），而且**字段可能不存在**，直接取会抛 `KeyError`。所以解析时做了兜底：
+### 5.2 响应解析：OpenAI 的返回 → 统一的 LLMResponse
 
 ```python
-def _parse_response(self, response) -> LLMResponse:
-    output = response.output
-    if output and output.choices:
-        msg = output.choices[0].message
-        content = msg.content or ""
+def _parse_response(self, resp_json: dict) -> LLMResponse:
+    choices = resp_json.get("choices") or []
+    if not choices:
+        return LLMResponse(content="")             # 没有 choices，视为空回复
 
-        tool_calls = None
-        try:
-            raw_tool_calls = msg.tool_calls
-            if raw_tool_calls:
-                tool_calls = [ToolCall(...) for tc in raw_tool_calls]
-        except (KeyError, AttributeError):
-            pass  # 没有工具调用，保持 None
+    message = choices[0].get("message") or {}
+    content = message.get("content") or ""
 
-        return LLMResponse(content=content, tool_calls=tool_calls, usage=usage)
-    return LLMResponse(content="")  # API 异常时返回空
+    # 工具调用：OpenAI 格式的 function.arguments 是 JSON 字符串
+    tool_calls = None
+    raw_tool_calls = message.get("tool_calls")
+    if raw_tool_calls:
+        tool_calls = []
+        for tc in raw_tool_calls:
+            fn = tc.get("function", {})
+            try:
+                arguments = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                arguments = {}                     # 参数不是合法 JSON 时兜底为空
+            tool_calls.append(ToolCall(id=tc.get("id", ""), name=fn.get("name", ""),
+                                       arguments=arguments))
+
+    usage = None
+    raw_usage = resp_json.get("usage")
+    if raw_usage:
+        # OpenAI 命名：prompt_tokens / completion_tokens
+        usage = TokenUsage(prompt_tokens=raw_usage.get("prompt_tokens") or 0,
+                           completion_tokens=raw_usage.get("completion_tokens") or 0)
+
+    return LLMResponse(content=content, tool_calls=tool_calls, usage=usage)
 ```
+
+一路用 `.get()` 而不是 `[]`：**LLM 返回的字段可能整块缺失**（没有工具调用、没有 usage），`.get()` 天然容错，比 `try / except KeyError` 干净。
 
 ### 5.3 核心方法：chat 与 chat_stream
 
 ```python
 async def chat(self, messages, tools=None, temperature=0.7) -> LLMResponse:
-    qwen_messages = self._to_qwen_messages(messages)
-    response = Generation.call(
-        api_key=self.api_key,
-        model=self.model,
-        messages=qwen_messages,
-        tools=tools,
-        result_format="message",   # 要求返回标准 message 结构
-        temperature=temperature,
-    )
-    return self._parse_response(response)
+    payload = {"model": self.model, "messages": self._to_qwen_messages(messages),
+               "temperature": temperature, "stream": False}
+    if tools:
+        payload["tools"] = tools
+
+    # requests 是阻塞的，必须丢进线程池 —— 否则多个子任务并行时 LLM 调用会互相排队
+    def _sync_call() -> dict:
+        resp = requests.post(self.BASE_URL, headers=self._headers(), json=payload,
+                             timeout=(10, 300))
+        if resp.status_code != 200:
+            # 不静默返回空：API 报错必须暴露，否则排查时一头雾水
+            raise RuntimeError(f"DashScope API {resp.status_code}: {self._extract_error(resp)}")
+        return resp.json()
+
+    resp_json = await asyncio.to_thread(_sync_call)
+    return self._parse_response(resp_json)
 ```
 
-流式版只多两行，也是将来 SSE 推送的关键：
+流式版的手法叫 **Queue 桥接**：同步线程逐行读 SSE，异步协程从 Queue 取 token 往外推。
 
 ```python
 async def chat_stream(self, messages, tools=None, temperature=0.7) -> AsyncIterator[str]:
-    ...
-    responses = Generation.call(
-        ...
-        stream=True,              # ← 关键：开启流式
-        incremental_output=True,  # ← 增量输出，每次只推新内容
-    )
-    for response in responses:
-        content = response.output.choices[0].message.content
-        if content:
-            yield content
+    q: asyncio.Queue[str] = asyncio.Queue()
+
+    def _sync_stream() -> None:
+        resp = requests.post(..., stream=True, timeout=(10, 300))
+        for line in resp.iter_lines(decode_unicode=True):   # SSE 每行：data: {...}
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":                            # 流式结束信号
+                break
+            delta = (json.loads(data).get("choices") or [{}])[0].get("delta") or {}
+            if delta.get("content"):
+                q.put_nowait(delta["content"])
+        q.put_nowait(None)                                  # None 当结束信号
+
+    task = asyncio.create_task(asyncio.to_thread(_sync_stream))
+    while True:
+        token = await q.get()
+        if token is None:
+            break
+        yield token
+    await task          # 收集线程里的异常（API 报错时在这里抛出来）
 ```
 
-> `incremental_output=True` 很关键：不开它，千问会每次重推**全部内容**；开了它，每次都只推**新增的那一小段**，省流量也省前端拼接的麻烦。
+> 为什么流式比普通版麻烦这么多？因为 `requests` 的流式读取是**同步阻塞**的，而 `chat_stream` 必须是**异步生成器**。**Queue 就是"同步世界"和"异步世界"之间的桥** —— 这套手法在第 06 章推 SSE 时还会再用一次。
 
 ### 5.4 踩过的坑（本文件真实记录）
 
 | 坑 | 现象 | 解法 |
 |---|---|---|
-| **Windows SSL 证书问题** | 开发环境请求失败，报证书验证错误 | 临时全局关闭 `verify=False`，代码里注释了"上线前务必删除" |
-| **字段不存在抛 KeyError** | 千问没返回工具调用 / usage 时，`msg.tool_calls` 取不到 | 用 `try / except (KeyError, AttributeError)` 兜底 |
-| **返回结构不对** | 不加 `result_format="message"` 时返回旧格式 | 显式指定 `result_format="message"` |
+| **旧端点不认新模型** | qwen3.7 全部返回空，SDK 报 `400 url error`，误以为模型名不存在 | 改用 **OpenAI 兼容端点**；**报错要信第一手信息** —— 用 requests 直连两个端点对比，200 的才是对的 |
+| **静默吞错** | `_parse_response` 返回空串，把 400 吞成了"模型返回空"，排查走了大弯路 | 非 200 **直接抛 `RuntimeError`**，错误不再被吞 |
+| **requests 阻塞事件循环** | 同步 HTTP 卡住整个 asyncio，并行子任务互相排队 | 丢进 `asyncio.to_thread` 线程池 |
+| **Windows SSL 证书问题** | 开发环境请求失败，报证书验证错误 | 临时全局 `verify=False`，代码里注释了"上线前务必删除" |
 
 ---
 
@@ -278,7 +328,7 @@ python scripts/smoke_llm.py
 - **统一数据结构**：`Message` / `ToolCall` / `TokenUsage` / `LLMResponse` 挡住 API 差异
 - **抽象基类**：只声明 `chat` / `chat_stream`，实现细节下沉到实现类
 - **工厂模式**：`create_llm()` 一行切换，换模型不动业务代码
-- **踩坑**：Windows SSL、千问字段 `KeyError`、`result_format="message"`
+- **踩坑**：dashscope 旧端点不认新模型（改走 OpenAI 兼容端点）、静默吞错、requests 阻塞事件循环、Windows SSL
 
 ---
 
