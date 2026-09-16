@@ -112,7 +112,11 @@
 
 ### 增补（09-16，工具边界从「子任务级」上移到「角色级」）
 
-- **角色级工具范围 ✅（09-16，591ce3e）**：原来 executor 按 planner 的 tool_hint 把注册中心收窄成**单个工具** —— 粒度绑错层：子任务是「执行实例」不是「职责单元」，planner 拆解不准时会**静默给出残缺结论**（守规矩的被削、不守规矩的反因 hint 非法而放开全集）。现在 registry 加 `TOOL_SCOPES` + `subset_scope()`：executor 固定拿 analysis 角色的 5 个数据工具；tool_hint 降级为 prompt 里「建议优先使用」的提示；**跨角色越界（分析任务想写文件）仍被 schema 挡住**。planner 硬规则改为「按要回答的问题拆、不按工具拆」。测试 14 项（角色范围 / 同角色连续调两个工具 / 跨角色拦截 / 未知范围降级告警），全量 110 项无失败。
+- **角色级工具范围 ✅（09-16，591ce3e）**：原来 executor 按 planner 的 tool_hint 把注册中心收窄成**单个工具** —— 粒度绑错层：子任务是「执行实例」不是「职责单元」，planner 拆解不准时会**静默给出残缺结论**（守规矩的被削、不守规矩的反因 hint 非法而放开全集）。现在 registry 加 `TOOL_SCOPES` + `subset_scope()`：executor 固定拿 analysis 角色的 5 个数据工具；tool_hint 降级为 prompt 里「建议优先使用」的提示；**跨角色越界（分析任务想写文件）仍被 schema 挡住**。planner 硬规则改为「按要回答的问题拆、不按工具拆」。测试 14 项（角色范围 / 同角色连续调两个工具 / 跨角色拦截 / 未知范围降级告警），全量 129 项无失败。
+
+### 增补（09-16，技能层：流程知识按需加载）
+
+- **技能（Skill）✅（09-16）**：`backend/skills/*.md` + 加载器（front-matter 解析），**目录即注册表** —— 加技能、改口径都不用改代码。**渐进披露**：常驻 planner prompt 的只有元数据（name + 一句适用场景，一个技能几十 token），只有 planner 判定命中才把**正文**（口径/步骤）拉进 context 重新规划一次；没命中就一个字都不加载。第一个技能 `weekly-report`（经营周报：销售环比 / 类目拆解 / 库存缺货 / 会员结构 四条口径）。降级路径都留了痕：编造技能名 → 忽略 + 告警；第二轮输出废 → 回退第一轮计划且**技能不计命中**（否则会出现"工具范围按技能放宽了、流程却没生效"，权限和实际做法对不上）。工具范围改为跟着**技能**走（registry 新增 `subset_scopes()` 取范围并集，技能可声明跨角色）。真机验证：`帮我出一份这周的经营周报` → 命中，拆 4 条且任务文本里出现了只写在技能正文里的"环比"；`为什么这周销售额掉了` → 未命中，planner 现编的 4 条质量相当（**即这个 A/B 看不出技能带来的提升** —— 收益在方差和"运营能自己改"，不在单次质量，面试要自己先说）。**边界**：子任务是并行的，"查完数据 → 落盘成文档"这类**有依赖**的跨角色流程做不了，要等依赖图（DAG）；`subset_scopes` 已就位且有单测，但暂无真实技能用到跨角色。测试 21 项（本文件 14→21），全量 **136 项**无失败。
 
 ### 尚未完成 ❌
 
@@ -150,15 +154,19 @@ ecommerce-agent/
 │   │   └── config.py               # 全局配置（.env → Pydantic）
 │   │
 │   ├── agents/                     # Agent 实现（supervisor 只做调度，人格/上下文收在各角色里）
-│   │   ├── supervisor.py           # 状态图组装 + 条件路由（intent → 4 条链路）
+│   │   ├── supervisor.py           # 状态图组装 + 条件路由（intent → 4 条链路；读技能决定工具范围）
 │   │   ├── intent_classifier.py    # 意图分类（analysis/content/service/document）
-│   │   ├── planner.py              # 拆子任务（输出做结构校验，P2-13）
-│   │   ├── executor.py             # 子任务执行（按角色收窄工具集 subset_scope；tool_hint 只是提示）
+│   │   ├── planner.py              # 拆子任务（结构校验；命中技能后带正文再规划一次）
+│   │   ├── executor.py             # 子任务执行（工具范围由技能/角色决定 subset_scopes；tool_hint 只是提示）
 │   │   ├── synthesizer.py          # 综合各子任务结果 → 报告（流式 / 可选 viz 块）
 │   │   ├── data_analysis/simple_agent.py  # ReActAgent（核心循环）
 │   │   ├── content_gen/            # 内容 Agent（文案/标题）
 │   │   ├── customer_service/       # 客服 Agent（查知识库）
 │   │   └── document/               # 文档 Agent（解析/优化/生成落盘）
+│   │
+│   ├── skills/                     # ★ 技能（流程知识包）：*.md + 加载器；元数据常驻 / 正文按需
+│   │   ├── __init__.py             # load_skills + front-matter 解析（目录即注册表）
+│   │   └── weekly-report.md        # 经营周报（口径：环比 / 类目 / 库存 / 会员）
 │   │
 │   ├── tools/                      # ★ 业务工具（三层注册）
 │   │   ├── data_tools/             # 5 个数据工具 + __init__ 注册
