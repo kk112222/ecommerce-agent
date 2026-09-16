@@ -80,7 +80,7 @@ export interface PlanItem {
 /** SSE 流式事件类型（对应后端 supervisor 的 on_event） */
 export type StreamEvent =
   | { type: "intent"; intent: string }    // 意图分类结果：analysis/content/service
-  | { type: "plan"; plan: PlanItem[] }
+  | { type: "plan"; plan: PlanItem[]; skill?: string }   // skill：命中的技能名（"" = 普通规划）
   | { type: "subtask"; id: string; task: string; result: string }
   | { type: "token"; content: string }   // 报告逐字片段（打字机效果）
   | { type: "report"; report: string }

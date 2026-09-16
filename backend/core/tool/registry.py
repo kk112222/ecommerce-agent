@@ -80,18 +80,35 @@ class ToolRegistry:
         return self.tools[name]
 
     def subset_scope(self, scope: str) -> "ToolRegistry":
-        """按**角色范围**取子集（TOOL_SCOPES）—— 子任务的能力边界按角色划，不按单条子任务划
+        """按**单个角色范围**取子集（TOOL_SCOPES）—— 子任务的能力边界按角色划，不按单条子任务划
 
         与 subset() 的关系：subset() 是"给我这几个名字"，subset_scope() 是"给我这个角色的能力范围"。
         """
-        names = TOOL_SCOPES.get(scope) or []
-        sub = self.subset(names)
-        if not sub.tools:
+        return self.subset_scopes([scope])
+
+    def subset_scopes(self, scopes) -> "ToolRegistry":
+        """按**多个范围取并集** —— 技能可以横跨角色（周报既要查数据、又要把结果落盘成文档）
+
+        与 subset_scope 的关系：单范围是它的特例。为什么能力边界要能跟着技能走：
+        "分析完直接写成文档"这种流程天然跨角色，如果边界死在"分析角色"上，
+        技能里那条落盘步骤会**调不动工具**（schema 里没有 write_document）——
+        这正是 2026-09-16 那次「边界绑错层级」踩出来的教训：边界该绑在**谁需要它**上，
+        而不是绑在"请求恰好从哪条链路进来"上。
+
+        越权依然被挡：范围是代码里写死的白名单，模型只能"在给定的几个范围里被分配"，
+        不能自己扩大范围 —— 它输出的是一个技能名，范围由技能声明决定。
+        """
+        names: list[str] = []
+        for s in scopes or []:
+            for n in TOOL_SCOPES.get(s) or []:
+                if n not in names:
+                    names.append(n)
+        if not names:
             # 范围名写错 / 工具没注册：放开全集，但绝不能不吭声（静默降级 = 没人查得到）
             logger.warning("工具范围 %r 为空或工具未注册，本次放开全集（%d 个工具）",
-                           scope, len(self.tools))
+                           list(scopes or []), len(self.tools))
             return self
-        return sub
+        return self.subset(names)
 
     def subset(self, names) -> "ToolRegistry":
         """只含指定工具的新注册中心（底层能力：由代码显式指定名字）

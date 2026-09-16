@@ -11,12 +11,15 @@ class Executor:
     def __init__(self,llm,registry):
         self.llm = llm
         self.registry = registry
-    async def run(self, task: dict, uploaded_data: str = "", user_profile: str = "") -> str:
+    async def run(self, task: dict, uploaded_data: str = "", user_profile: str = "",
+                  scopes: list[str] | None = None) -> str:
         """跑一个子任务。
 
         - uploaded_data / user_profile：以前没有 → "结合上传的竞品数据分析"这类子任务
           手里根本没有竞品数据（文档链路能拿到，分析链路拿不到，是断链）
         - tool_hint：**只是"从哪个工具入手"的提示，不是权限边界**（2026-09-16 调整）
+        - scopes：这次子任务能用的工具范围（TOOL_SCOPES 的名字，可多个取并集）。
+          不传 = 走默认的 analysis 角色范围；命中技能时由**技能**声明它要哪几个范围。
 
         能力边界按**角色**划、不按单条子任务划，原因：
         - 子任务的语义是"回答一个问题"，它天然可能要用多个工具（查销售 → 发现跌 → 再查库存、
@@ -56,8 +59,10 @@ class Executor:
             system_prompt += f"\n\n【用户画像】\n{user_profile}"
         if uploaded_data:
             system_prompt += f"\n\n【上传数据】\n{uploaded_data}"
-        # ② 复用 ReActAgent 跑一个独立 ReAct 循环（拿"分析角色"的完整工具范围，而不是单个工具）
-        registry = self.registry.subset_scope("analysis")
+        # ② 复用 ReActAgent 跑一个独立 ReAct 循环
+        # 拿的是**范围**（默认 analysis 角色，命中技能时按技能声明的范围并集），不是单个工具。
+        # 边界仍然由代码里的白名单定死：模型能选的只有"用哪个技能"，选不了"要多大权限"。
+        registry = self.registry.subset_scopes(scopes or ["analysis"])
         agent = ReActAgent(self.llm, registry)
         result = await agent.run([Message(role="system",content=system_prompt)])
         # ③ 空结果兜底：LLM 偶发返回空串，不能让空结果流到综合报告

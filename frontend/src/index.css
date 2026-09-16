@@ -213,6 +213,12 @@ details.act-out pre {
 .trace-main { flex: 1; min-width: 0; }
 .trace-line { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .trace-label { font-size: 12.5px; color: var(--text-2); }
+/* 命中的技能标记：用 --info 和工具提示（--text-3）区分开，一眼看出这轮走了流程 */
+.trace-skill {
+  margin-top: 5px; font-family: var(--mono); font-size: 11px;
+  color: var(--info); border: 1px solid color-mix(in srgb, var(--info) 35%, transparent);
+  border-radius: 4px; padding: 1px 6px; display: inline-block;
+}
 .trace-row.running .trace-label { color: var(--text); }
 .trace-row.error .trace-label { color: var(--err); }
 .trace-cost { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); flex-shrink: 0; }

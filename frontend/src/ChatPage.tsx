@@ -159,7 +159,7 @@ export default function ChatPage({ initialSessionId, onSessionIdChange }: ChatPa
             }
             break;
           case 'plan':
-            finishStep('plan', { plan: event.plan });
+            finishStep('plan', { plan: event.plan, skill: event.skill });
             // 计划拆出来后，为每个子任务建一个 running 步骤（执行完逐个打勾）
             event.plan.forEach((p, i) => {
               pushStep({

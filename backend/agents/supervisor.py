@@ -9,6 +9,7 @@ from backend.agents.synthesizer import Synthesizer
 from backend.agents.content_gen.content_agent import ContentAgent
 from backend.agents.customer_service.service_agent import ServiceAgent
 from backend.agents.document.document_agent import DocumentAgent
+from backend.skills import load_skills
 
 logger = logging.getLogger("ecommerce-agent")   # 与 chat.py / 中间件同 logger，日志格式统一
 
@@ -58,7 +59,11 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
     BudgetExceeded 并降级；预算账本由调用方持有，最后统一汇总成 usage 事件。
     """
     classifier = IntentClassifier(llm)
-    planner = Planner(llm, registry)
+    # 技能在装配时读一次（build_supervisor 每轮请求调一次），planner 和 executor 共用同一份：
+    # planner 用它的**元数据**挑选，executor 用命中技能的 **scopes** 决定工具范围
+    skills = load_skills()
+    skills_by_name = {s.name: s for s in skills}
+    planner = Planner(llm, registry, skills)
     executor = Executor(llm, registry)
     synthesizer = Synthesizer(llm, registry)
     # 角色 Agent：人格 prompt 和上下文组装收在各自文件里（content_gen / customer_service），
@@ -83,26 +88,35 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
     # ============ 数据分析链路 ============
     async def planner_node(state):
         try:
-            state["plan"] = await planner.plan(
+            planned = await planner.plan(
                 state["goal"],
                 history=state.get("history", ""),
                 user_profile=state.get("user_profile", ""),
                 uploaded_data=state.get("uploaded_data", ""),
             )
+            state["plan"] = planned["tasks"]
+            state["skill"] = planned["skill"]
         except BudgetExceeded:
             state["plan"] = []          # 没有额度做规划：不猜任务，直接走"无结果"降级报告
+            state["skill"] = ""
         if on_event:
-            await on_event({"type": "plan", "plan": state["plan"]})
+            # 技能名一起推给前端：活动流里能看出"这一轮走的是哪套预置流程"
+            await on_event({"type": "plan", "plan": state["plan"],
+                            "skill": state.get("skill", "")})
         return state
 
     async def executor_node(state):
         plan = state["plan"]
+        # 工具范围跟着**技能**走（没命中技能就是 None → executor 用默认的 analysis 角色范围）
+        skill = skills_by_name.get(state.get("skill") or "")
+        scopes = skill.scopes if skill else None
         async def run_one(t):
             # 把上下文透传给子任务：以前只传 task，导致"结合上传数据做竞品对比"的子任务拿不到原料
             try:
                 r = await executor.run(t,
                                        uploaded_data=state.get("uploaded_data", ""),
-                                       user_profile=state.get("user_profile", ""))
+                                       user_profile=state.get("user_profile", ""),
+                                       scopes=scopes)
             except BudgetExceeded as e:
                 # 一个子任务把额度吃光了，不能连累其余三个：这一格用降级文案占位，
                 # 报告结构保持完整，synthesizer 还能把跑完的部分综合出来

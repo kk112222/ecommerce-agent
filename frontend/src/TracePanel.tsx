@@ -12,6 +12,7 @@ export interface TraceStep {
   startedAt?: number;   // 进入 running 的时间戳，done 时用它算耗时
   costMs?: number;      // 步骤耗时（done/error 时填充）
   plan?: PlanItem[];    // plan 步骤携带：拆出的子任务列表
+  skill?: string;       // plan 步骤携带：命中的技能名（走的是哪套预置流程）
   toolHint?: string;    // subtask 步骤携带：计划里提示用什么工具
   result?: string;      // subtask 步骤携带：该子任务的执行结果摘要
 }
@@ -46,6 +47,11 @@ function TraceRow({ s }: { s: TraceStep }) {
           {s.costMs != null && <span className="trace-cost">{fmtMs(s.costMs)}</span>}
         </div>
         {/* plan 步骤：把拆出来的子任务和它们的工具提示摊开 */}
+        {s.kind === 'plan' && s.skill && (
+          // 命中技能时标一下"这一轮走的不是现编，而是预置流程"——不然用户看到的
+          // 只是"拆得更整齐了"，看不出差别在哪
+          <div className="trace-skill">技能 · {s.skill}</div>
+        )}
         {s.kind === 'plan' && s.plan && (
           <ul className="act-list">
             {s.plan.map((p, i) => (

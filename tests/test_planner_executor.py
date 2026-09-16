@@ -1,17 +1,21 @@
-"""Planner 输出校验 + Executor 工具范围（离线）
+"""Planner 输出校验 + 技能加载 + Executor 工具范围（离线）
 
-这两块都是"LLM 输出不可信"的典型现场：
+这三块都是"LLM 输出不可信"的典型现场：
 - Planner：LLM 给的 JSON 形状千奇百怪，以前只判 isinstance(list)，id 重复会把两条子任务结果
   折叠成一条（静默丢结果），缺 task 直接 KeyError 崩掉整轮。
+- 技能（Skill）：元数据常驻 prompt、正文只在命中后才加载。下面钉的是"**别把正文常驻**"
+  （否则加技能=每轮都多几百 token，渐进披露就白做了）和"命中之后的降级路径"。
 - Executor：能力边界从"单条子任务"上移到"角色"（2026-09-16 调整）。
   旧做法是按 planner 的 tool_hint 把注册中心收窄成"只含那一个工具"：省 token、硬隔离，
   但子任务的语义是"回答一个问题"，它天然可能要多工具（查销售 → 再查库存），
   拆解不准时就会**静默给出残缺结论**。新做法：子任务拿 analysis 角色的 5 个数据工具，
   tool_hint 降级成"建议优先使用"的提示；跨角色越界（分析任务想写文件）仍被 schema 挡住。
-下面钉的就是这条边界：同角色可多工具、跨角色必须拦住。
+  更进一步：边界跟着**技能**走 —— 技能声明 scopes，跨角色的流程（查完数据再落盘成文档）
+  才拿得到跨角色的工具，而范围本身仍是代码里的白名单。
 """
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -19,9 +23,16 @@ from backend.agents.executor import Executor
 from backend.agents.planner import Planner
 from backend.core.llm.base import BaseLLM, LLMResponse, ToolCall
 from backend.core.tool.registry import TOOL_SCOPES, ToolRegistry
+from backend.skills import Skill, load_skills
 from backend.tools import register_all_tools
 
 ANALYSIS_SCOPE = TOOL_SCOPES["analysis"]
+
+# 测试用技能：正文里放一个只可能来自 body 的标记串，用来断言"命中才加载"
+BODY_MARK = "【技能正文标记】先查销售再查库存"
+FAKE_SKILL = Skill(name="weekly-report", title="经营周报",
+                   when="用户要周报/复盘", scopes=["analysis", "document"],
+                   body=BODY_MARK, path=Path("<test>"))
 
 
 class _RecordingLLM(BaseLLM):
@@ -31,10 +42,12 @@ class _RecordingLLM(BaseLLM):
         self._responses = list(responses or [])
         self.tools_seen: list = []
         self.last_messages: list = []
+        self.messages_seen: list[list] = []      # 每次调用的完整 prompt 快照（多轮断言用）
 
     async def chat(self, messages, tools=None, temperature=0.7) -> LLMResponse:
         self.tools_seen.append(tools)
         self.last_messages = list(messages)
+        self.messages_seen.append(list(messages))
         if self._responses:
             return self._responses.pop(0)
         return LLMResponse(content="（子任务结论）")
@@ -59,11 +72,24 @@ def _names(tools) -> list[str]:
     return sorted(t["function"]["name"] for t in (tools or []))
 
 
-def _plan(payload) -> list[dict]:
-    """拿一段 LLM 输出喂给 Planner，返回清洗后的计划"""
-    llm = _RecordingLLM([LLMResponse(content=payload if isinstance(payload, str)
-                                     else json.dumps(payload, ensure_ascii=False))])
-    return _run(Planner(llm, _registry()).plan("分析本周销售"))
+def _payload(content) -> str:
+    return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+
+
+def _plan(payload, skills=()) -> list[dict]:
+    """拿一段 LLM 输出喂给 Planner，返回清洗后的子任务列表
+
+    skills 默认给空 tuple（**不启用技能**），让不关心技能的用例行为保持稳定；
+    要测技能就显式传 FAKE_SKILL 之类。
+    """
+    llm = _RecordingLLM([LLMResponse(content=_payload(payload))])
+    return _run(Planner(llm, _registry(), list(skills)).plan("分析本周销售"))["tasks"]
+
+
+def _plan_multi(responses, skills=(), goal="分析本周销售"):
+    """多轮场景：依次吐出 responses，返回 (计划结果, 假 LLM（用来数调用次数/看 prompt）)"""
+    llm = _RecordingLLM([LLMResponse(content=_payload(r)) for r in responses])
+    return _run(Planner(llm, _registry(), list(skills)).plan(goal)), llm
 
 
 def _run(coro):
@@ -156,6 +182,89 @@ def test_plan_is_capped():
     assert len(plan) == Planner.MAX_TASKS
 
 
+# ==================== 技能：元数据常驻、正文按需加载 ====================
+
+def test_skill_metadata_in_prompt_but_body_not():
+    """渐进披露的核心断言：**没命中时，正文一个字都不该进 prompt**
+
+    如果正文跟着元数据一起常驻，加 10 个技能就是每轮多几千 token —— 那和"把知识全塞
+    system prompt"没区别，技能机制白做。常驻的只有 name + 一句适用场景。
+    """
+    llm = _RecordingLLM([LLMResponse(content='{"skill":"","tasks":[]}')])
+    _run(Planner(llm, _registry(), [FAKE_SKILL]).plan("随便问问"))
+
+    prompt = llm.last_messages[0].content
+    assert "weekly-report" in prompt and "用户要周报/复盘" in prompt   # 元数据在
+    assert BODY_MARK not in prompt                                     # 正文不在
+    assert len(llm.messages_seen) == 1, "没命中就不该有第二次调用"
+
+
+def test_skill_hit_loads_body_and_replans():
+    """命中技能 → 用**带正文**的 prompt 重新规划一次，最终计划来自第二轮"""
+    (result, llm) = _plan_multi([
+        {"skill": "weekly-report",
+         "tasks": [{"id": "t1", "task": "第一轮的粗计划", "tool_hint": ""}]},
+        {"tasks": [{"id": "t1", "task": "查本周期销售并取上周期做环比", "tool_hint": "query_sales"},
+                   {"id": "t2", "task": "查库存缺货清单", "tool_hint": "check_stock"}]},
+    ], skills=[FAKE_SKILL])
+
+    assert result["skill"] == "weekly-report"
+    assert len(llm.messages_seen) == 2, "命中技能应当且只应当多一次调用"
+    second_prompt = llm.messages_seen[1][0].content
+    assert BODY_MARK in second_prompt, "第二轮必须带上技能正文（这才是'加载'）"
+    assert "经营周报" in second_prompt
+    assert [t["task"] for t in result["tasks"]] == ["查本周期销售并取上周期做环比", "查库存缺货清单"]
+
+
+def test_fabricated_skill_name_ignored_with_warning(caplog):
+    """编造技能名 → 忽略 + 告警（和 tool_hint 同一套处理），不额外调用一轮"""
+    with caplog.at_level(logging.WARNING, logger="ecommerce-agent"):
+        (result, llm) = _plan_multi([
+            {"skill": "不存在的技能",
+             "tasks": [{"id": "t1", "task": "查销售额", "tool_hint": "query_sales"}]},
+        ], skills=[FAKE_SKILL])
+
+    assert result["skill"] == ""
+    assert len(llm.messages_seen) == 1
+    assert any("不存在的技能名" in r.getMessage() for r in caplog.records)
+
+
+def test_skill_replan_failure_falls_back_to_plain_plan(caplog):
+    """正文加载了但第二轮输出废 → 退回第一轮计划，且**技能不算命中**
+
+    为什么不算命中、而不是"算命中但用第一轮计划"：技能一旦算命中，executor 就会按
+    `skill.scopes` 放宽工具范围（周报那个技能能拿到 write_document）。若此时计划还是
+    现编的，就等于"权限跟着技能走、技能却没真生效" —— 权限和实际用的流程对不上。
+    """
+    with caplog.at_level(logging.WARNING, logger="ecommerce-agent"):
+        (result, llm) = _plan_multi([
+            {"skill": "weekly-report",
+             "tasks": [{"id": "t1", "task": "查销售额", "tool_hint": "query_sales"}]},
+            "这不是 JSON",
+        ], skills=[FAKE_SKILL])
+
+    assert result["skill"] == ""                                  # 不计命中（范围不放宽）
+    assert [t["task"] for t in result["tasks"]] == ["查销售额"]     # 计划退回第一轮
+    assert len(llm.messages_seen) == 2
+    assert any("没能规划出可用计划" in r.getMessage() for r in caplog.records)
+
+
+def test_real_skill_files_are_parsable():
+    """钉住仓库里真实的技能文件：front-matter 能解析、正文非空、范围合法
+
+    技能是纯文本数据，没有类型检查兜底 —— 写错一个字段（比如 scopes 拼错）就静默失效，
+    表现是"技能好像没生效"。这条用例让它在测试里当场炸出来。
+    """
+    skills = load_skills()
+    assert skills, "backend/skills/ 下至少要有一个技能文件"
+    wr = next(s for s in skills if s.name == "weekly-report")
+    assert wr.title and wr.when and wr.body
+    assert "环比" in wr.body, "周报的口径（必须做环比对照）应当写在正文里"
+    assert wr.scopes and all(s in TOOL_SCOPES for s in wr.scopes), \
+        f"scopes 必须是 TOOL_SCOPES 里存在的范围名，实际 {wr.scopes}"
+    assert not wr.body.lstrip().startswith("---"), "front-matter 不该混进正文"
+
+
 # ==================== Executor：能力边界在"角色"上 ====================
 
 def test_executor_gets_analysis_role_scope():
@@ -225,6 +334,35 @@ def test_cross_role_tool_is_structurally_blocked():
     assert res.success is False
     assert "没有名为 write_document 的工具" in (res.error or "")
     assert "query_sales" in (res.error or ""), "错误里要告诉它可用工具有哪些"
+
+
+def test_executor_scopes_follow_skill():
+    """技能声明了跨角色范围 → 子任务真的拿到跨角色的工具（默认路径仍拿不到）
+
+    这是"边界跟着技能走"的正面用例：周报这种流程查完数据还要落盘成文档，
+    如果边界死在分析角色上，那条落盘步骤会因为 schema 里没有 write_document 而调不动。
+    """
+    llm = _RecordingLLM()
+    ex = Executor(llm, _registry())
+    _run(ex.run({"id": "t1", "task": "把周报落盘", "tool_hint": ""},
+                scopes=["analysis", "document"]))
+
+    names = _names(llm.tools_seen[0])
+    assert "write_document" in names and "query_sales" in names
+    assert "copy_generator" not in names, "技能没声明的角色范围不该被顺带放开"
+    assert "search_knowledge_base" not in names
+
+
+def test_subset_scopes_unions_and_falls_back(caplog):
+    """多个范围取并集；空范围 / 全不合法 → 放开全集 + 告警（降级原则不变）"""
+    reg = _registry()
+    union = reg.subset_scopes(["content", "document"])
+    assert sorted(union.tools) == sorted(set(TOOL_SCOPES["content"]) | set(TOOL_SCOPES["document"]))
+
+    with caplog.at_level(logging.WARNING, logger="ecommerce-agent"):
+        assert len(reg.subset_scopes([]).tools) == len(reg.tools)
+        assert len(reg.subset_scopes(["不存在的角色"]).tools) == len(reg.tools)
+    assert sum("为空或工具未注册" in r.getMessage() for r in caplog.records) == 2
 
 
 def test_unknown_scope_falls_back_to_full_registry(caplog):
