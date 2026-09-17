@@ -3,6 +3,7 @@ name: weekly-report
 title: 经营周报
 when: 用户要"周报 / 月报 / 复盘 / 总结这一周（月）的经营情况"，或要求按固定口径汇总一段时间的整体表现
 scopes: analysis
+save: 经营周报-{date}.md
 ---
 
 # 经营周报

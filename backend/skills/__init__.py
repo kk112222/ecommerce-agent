@@ -38,13 +38,14 @@ class Skill:
     when: str                       # 适用场景（常驻 prompt 的那一句话）
     scopes: list[str] = field(default_factory=list)   # 需要的工具范围（TOOL_SCOPES 的 key，可多个）
     body: str = ""                  # 正文：口径 / 步骤 / 输出要求（命中后才进 context）
+    save: str = ""                  # 报告落盘的文件名模板（可含 {date}），非空 = 出报告后存成文件
     path: Path | None = None
 
 
 def _parse(text: str) -> tuple[dict, str]:
     """拆成 (front-matter dict, 正文)；没有 front-matter 就当整篇是正文
 
-    只认 `key: value` 这种最朴素的写法，不引 yaml —— 技能的元数据就四个字段，
+    只认 `key: value` 这种最朴素的写法，不引 yaml —— 技能的元数据就五个字段，
     为此多装一个依赖不划算。值里带冒号也没问题（按第一个冒号切）。
     """
     m = _FRONT_MATTER.match(text)
@@ -81,6 +82,7 @@ def load_skills(skill_dir: Path | None = None) -> list[Skill]:
             when=(meta.get("when") or "").strip(),
             scopes=[s.strip() for s in (meta.get("scopes") or "").split(",") if s.strip()],
             body=body.strip(),
+            save=(meta.get("save") or "").strip(),
             path=path,
         ))
     return skills

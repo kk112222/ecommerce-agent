@@ -198,6 +198,15 @@ async def test_synthesizer_fallback_keeps_subtask_results():
     assert "预算" in final["report"]                       # 让用户知道这是被截断的
 
 
+async def test_degraded_report_is_marked_so_save_can_skip():
+    """兜底报告要打 report_degraded 标记 —— 落盘节点据此跳过（否则残件会被存成「经营周报」）"""
+    llm = _StreamBlocked([INTENT, PLAN, "销售环比上升 12%", "库存积压 300 件"])
+    final = await _graph(llm).invoke({"goal": "这周为什么掉量"})
+
+    assert final.get("report_degraded") is True, "预算兜底的报告必须打标记"
+
+
+
 async def test_role_chain_degrades():
     """内容/客服/文档链路只有一步 LLM：额度没了也不能崩"""
     llm = _BlockAfter(['{"intent": "content"}'], block_after=1)

@@ -35,7 +35,9 @@ class DocumentAgent:
 
     def __init__(self, llm, registry):
         self.llm = llm
-        self.registry = registry
+        # 角色级边界：只装 document 范围（optimize_document / write_document）。
+        # 同 ContentAgent / ServiceAgent —— 文档专员手里不该有查销售数据的工具
+        self.registry = registry.subset_scopes(["document"])
 
     async def run(self, goal: str, history: str = "", user_profile: str = "",
                   uploaded_data: str = "") -> str:

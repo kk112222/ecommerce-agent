@@ -30,13 +30,20 @@ class Executor:
         - 所以这里给子任务的是 analysis 角色的 5 个数据工具：职责隔离仍在（写文件、发文案的工具
           根本不在 schema 里），但同角色内可以交叉验证。
         """
-        # ① 构造"子任务专属"system prompt
+        # ① 先定本次的能力范围（默认 analysis 角色；命中技能时按技能声明的范围并集）。
+        # 必须**先于** hint 校验：提示得落在"本次真能调的工具"里，否则会出现
+        # 【建议优先使用】write_document、而手里只有 5 个数据工具 —— 模型去调、白耗一轮
+        registry = self.registry.subset_scopes(scopes or ["analysis"])
+
+        # ② 构造"子任务专属"system prompt
         today = datetime.now().strftime("%Y-%m-%d")  # 算今天
         hint = (task.get("tool_hint") or "").strip()
-        allowed = hint if hint in self.registry.tools else ""     # 非法/为空 → 不给提示（不影响权限）
+        # 校验用**收窄后**的注册中心，不是全集：超出本次角色范围的提示一律丢掉（只影响提示质量）
+        allowed = hint if hint in registry.tools else ""
         if hint and not allowed:
-            # planner 那边已经会清空非法 hint 并告警，走到这里说明是别的调用方直接给的
-            logger.warning("tool_hint 不是合法工具名，本次忽略该提示：%r（子任务 %s）",
+            # planner 那边已经会清空非法 hint 并告警，走到这里说明是别的调用方直接给的，
+            # 或者 hint 属于别的角色（分析子任务被填了 write_document 这类）
+            logger.warning("tool_hint 不在本次工具范围内，已忽略该提示：%r（子任务 %s）",
                            hint, task.get("id"))
         system_prompt = f"""你是数据分析子任务执行者,今天是{today}。你被分配了一个明确的子任务，只完成它，不要跑题。
 
@@ -59,13 +66,12 @@ class Executor:
             system_prompt += f"\n\n【用户画像】\n{user_profile}"
         if uploaded_data:
             system_prompt += f"\n\n【上传数据】\n{uploaded_data}"
-        # ② 复用 ReActAgent 跑一个独立 ReAct 循环
-        # 拿的是**范围**（默认 analysis 角色，命中技能时按技能声明的范围并集），不是单个工具。
+        # ③ 复用 ReActAgent 跑一个独立 ReAct 循环
+        # 拿的是上面定好的**范围**，不是单个工具。
         # 边界仍然由代码里的白名单定死：模型能选的只有"用哪个技能"，选不了"要多大权限"。
-        registry = self.registry.subset_scopes(scopes or ["analysis"])
         agent = ReActAgent(self.llm, registry)
         result = await agent.run([Message(role="system",content=system_prompt)])
-        # ③ 空结果兜底：LLM 偶发返回空串，不能让空结果流到综合报告
+        # ④ 空结果兜底：LLM 偶发返回空串，不能让空结果流到综合报告
         if not result or not result.strip():
             return "该子任务未获取到数据：工具查询无结果或执行器未返回内容。"
         return result

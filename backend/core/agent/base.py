@@ -17,7 +17,11 @@ class AgentGraph:
         self.edges.append((start,end))
     def add_condition_edges(self,source:str,router:Callable,
                             mapping:dict[str,str]):
-        """条件边：source 节点跑完后，根据 router 函数的返回值选下一个节点"""
+        """条件边：source 节点跑完后，根据 router 函数的返回值选下一个节点
+
+        mapping 的值允许是 None —— 表示**到此结束**（invoke 的 `while current:` 遇到假值
+        就退出）。用来挂"可选的尾巴"：比如 synthesize 之后要不要再落盘。
+        """
         self.conditions[source] = lambda state:mapping[router(state)]
 
     async def invoke(self, state: State) -> State:

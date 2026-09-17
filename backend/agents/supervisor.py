@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from datetime import datetime
+from pathlib import Path
 from backend.core.agent.base import AgentGraph
 from backend.core.llm.budget import BudgetExceeded
 from backend.agents.intent_classifier import IntentClassifier
@@ -155,6 +157,9 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
             # 综合报告是"最后一步"，额度耗尽时前面查到的数据不能丢：
             # 已经流式产出过半就保留，一个字都没有就用子任务结果拼一份兜底
             full = f"{full}\n\n{_budget_note(e)}" if full else _fallback_report(state)
+            # 打标记：这份报告是兜底产物，不是"正经营周报"。下游 save 节点据此跳过落盘 ——
+            # 否则残件会被存成「经营周报-<date>.md」，交付物里混进残件、看文件名还看不出来。
+            state["report_degraded"] = True
         state["report"] = full
         if on_event:
             await on_event({"type": "report", "report": full})
@@ -206,6 +211,57 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
             await on_event({"type": "report", "report": state["report"]})
         return state
 
+    # ============ 报告落盘（技能声明的后置步骤） ============
+    async def save_node(state):
+        """把最终报告存成文件 —— 只有技能在 front-matter 里声明了 save: 才会走到这
+
+        为什么是独立节点，而不是"给 executor 放开 document 范围"：
+        executor 跑在 synthesize **之前**，state["report"] 那时还没诞生 —— 它手里根本没有
+        要落盘的东西。落盘对象在报告产出之后才存在，所以这一步只能挂在 synthesize 下游。
+
+        两条边界（2026-09-17 补）：
+        - **降级报告不落盘**：synthesize 走兜底时 state 带 report_degraded 标记，这里直接返回 ——
+          残件混进交付物比不落盘更糟；
+        - **落到非用户目录要告警**：工具的 user_id/session_id 来自注册时的 context，缺了就落到
+          outputs/ 根目录，而下载/列表都以 outputs/user_<id>/ 为根 → 静默变成孤儿文件。
+
+        落盘通知不用新造事件：WriteDocument 的 on_document 回调会把 document 事件塞进
+        SSE 队列（chat.py 把 queue.put_nowait 注进了工具 context），前端已有的 document
+        分支会自动给出下载入口 + 时间线步骤。
+        """
+        skill = skills_by_name.get(state.get("skill") or "")
+        pattern = (skill.save if skill else "").strip()
+        report = (state.get("report") or "").strip()
+        if not pattern or not report:          # 没声明落盘 / 报告是空的 → 什么都不做
+            return state
+        # 兜底/降级产出的报告不落盘：那不是「经营周报」，是残件（开头就写着"预算限制提前结束"）。
+        # 存下去比不落盘更糟 —— 交付物里混进残件，而看文件名完全看不出来。
+        if state.get("report_degraded"):
+            logger.warning("报告是降级产出（预算/异常兜底），本次不落盘（技能 %s）", skill.name)
+            return state
+
+        # 技能只声明"存成什么文件"（文件名可带 {date}）；路径安全与目录隔离由 doc_output 那层管
+        target = Path(pattern.replace("{date}", datetime.now().strftime("%Y-%m-%d")))
+        result = await registry.execute(
+            "write_document",
+            filename=target.stem or "报告",
+            content=report,
+            format=target.suffix.lstrip(".").lower() or "md",
+        )
+        # 落盘失败不能连累报告：报告早就流式推给前端了，这里只留痕
+        if result.success:
+            state["saved_file"] = (result.data or {}).get("path", "")
+            # 工具 context 缺 user_id/session_id 时（例如 cli.py 那样 register_all_tools 不带 context），
+            # 文件会落到 outputs/ 根目录：文件确实在，但 list_documents / resolve_user_file 都以
+            # outputs/user_<id>/ 为根 → "存了、谁都拿不到"。必须留痕，不能只打一句 INFO。
+            if "user_" not in state["saved_file"]:
+                logger.warning("报告落到了非用户目录（工具 context 缺 user_id/session_id？）：%s",
+                               state["saved_file"])
+            logger.info("报告已落盘（技能 %s）：%s", skill.name, state["saved_file"])
+        else:
+            logger.warning("报告落盘失败（技能 %s）：%s", skill.name, result.error)
+        return state
+
     # ============ 组装图 ============
     graph = AgentGraph()
     graph.add_node("intent", intent_node)
@@ -215,10 +271,20 @@ def build_supervisor(llm, registry, on_event=None) -> AgentGraph:
     graph.add_node("content", content_node)
     graph.add_node("service", service_node)
     graph.add_node("document", document_node)
+    graph.add_node("save", save_node)
 
     # 数据分析链路：串行
     graph.add_edge("planner", "executor")
     graph.add_edge("executor", "synthesize")
+
+    # 落盘是 synthesize 的**可选后置**：技能声明了 save 才走，没声明就到 None=结束
+    def save_router(state):
+        skill = skills_by_name.get(state.get("skill") or "")
+        return "save" if (skill and skill.save) else "end"
+    graph.add_condition_edges("synthesize", save_router, {
+        "save": "save",
+        "end": None,          # None = 终止（invoke 的 while current: 遇假值即退出）
+    })
 
     # 条件边：intent 跑完后，根据 state["intent"] 选链路（router 是同步函数）
     def intent_router(state):

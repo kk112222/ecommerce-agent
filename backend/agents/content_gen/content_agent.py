@@ -27,7 +27,10 @@ class ContentAgent:
 
     def __init__(self, llm, registry):
         self.llm = llm
-        self.registry = registry
+        # 角色级边界：只装 content 范围的工具。别的工具（查数据、写文件）既不进 schema
+        # （模型看不到说明书），也调不动 —— 与 executor 的 analysis 边界对称：
+        # 边界靠代码白名单焊死，不靠 SYSTEM_PROMPT 里那句"只调用内容类工具"
+        self.registry = registry.subset_scopes(["content"])
 
     async def run(self, goal: str, history: str = "", user_profile: str = "") -> str:
         """执行一次内容创作，返回最终文案字符串"""

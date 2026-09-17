@@ -85,7 +85,7 @@ class Planner:
         {skill.body}
 
         【可用工具】
-        {self._tool_list()}
+        {self._tool_list(skill)}
 
         【硬规则】
         1. 按技能里列的维度拆子任务（通常就是 2~5 条），每条必须能独立完成、不依赖其他子任务的输出
@@ -126,10 +126,19 @@ class Planner:
           {{"id": "t2", "task": "一句话说明要查什么数据", "tool_hint": "工具名"}}
         ]}}"""
 
-    def _tool_list(self) -> str:
+    def _tool_list(self, skill: Skill | None = None) -> str:
+        """列出**本次子任务真能用**的工具 —— 必须和 executor 拿到的范围一致
+
+        以前列的是全集：planner 看得见 write_document / copy_generator，就可能给分析类
+        子任务填上 tool_hint="write_document"，而 executor 手里根本没有这个工具 → 白耗一轮。
+        范围规则与 supervisor 交给 executor 的完全同款：没命中技能 = analysis 角色；
+        命中技能 = 技能声明的范围（可多个，跨角色）。
+        """
+        scopes = (skill.scopes if skill else None) or ["analysis"]
+        tools = self.registry.subset_scopes(scopes).tools
         return "\n".join(
             f"- {tool.spec.name}: {tool.spec.description}"
-            for tool in self.registry.tools.values()
+            for tool in tools.values()
         )
 
     def _pick_skill(self, name) -> Skill | None:

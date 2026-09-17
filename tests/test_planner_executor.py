@@ -159,6 +159,36 @@ def test_plan_prompt_marks_hint_as_hint_not_permission():
     assert "调用多个工具" in prompt
 
 
+def test_plan_prompt_lists_only_tools_subtasks_can_use():
+    """回归：planner 列的工具必须 == executor 实际能调的（收窄后的范围）
+
+    以前列的是全集：模型看得见 write_document / copy_generator，就可能给分析类子任务
+    填上写文件的 hint，而 executor 手里只有 analysis 的 5 个数据工具 → 提示落空、白耗一轮。
+    清单和能力对不上，模型就会规划出自己执行不了的任务。
+    """
+    llm = _RecordingLLM([LLMResponse(content='{"skill":"","tasks":[]}')])
+    _run(Planner(llm, _registry(), []).plan("这周为什么掉量"))
+
+    prompt = llm.last_messages[0].content
+    assert "query_sales" in prompt
+    assert "write_document" not in prompt, "别的角色的工具不该出现在分析规划的工具清单里"
+    assert "copy_generator" not in prompt
+    assert "search_knowledge_base" not in prompt
+
+
+def test_plan_prompt_follows_skill_scopes():
+    """命中跨角色技能 → 工具清单跟着技能放宽，和 executor 拿到的范围保持一致"""
+    (_, llm) = _plan_multi([
+        {"skill": "weekly-report",
+         "tasks": [{"id": "t1", "task": "查本周期销售", "tool_hint": "query_sales"}]},
+        {"tasks": [{"id": "t1", "task": "查本周期销售", "tool_hint": "query_sales"}]},
+    ], skills=[FAKE_SKILL])
+
+    second_prompt = llm.messages_seen[1][0].content
+    assert "write_document" in second_prompt, "技能声明了 document 范围，规划时就该看得见落盘工具"
+    assert "copy_generator" not in second_prompt, "技能没声明的范围不该被顺带放开"
+
+
 def test_multi_tool_hint_is_cleared_and_logged(caplog):
     """一条子任务填多个工具名 → 清空 + 告警（首选工具只该有一个）
 
@@ -351,6 +381,33 @@ def test_executor_scopes_follow_skill():
     assert "write_document" in names and "query_sales" in names
     assert "copy_generator" not in names, "技能没声明的角色范围不该被顺带放开"
     assert "search_knowledge_base" not in names
+
+
+def test_executor_drops_hint_outside_current_scope(caplog):
+    """回归：hint 校验必须用**收窄后**的注册中心，不是全集
+
+    以前校验查的是 self.registry（全集）：planner 填的 write_document 在全集里，于是被当成
+    合法提示写进 prompt，可 ReActAgent 手里只有 5 个数据工具 → 模型照着提示去调、调不到，白耗一轮。
+    提示和权限必须是同一份范围。
+    """
+    llm = _RecordingLLM()
+    ex = Executor(llm, _registry())
+    with caplog.at_level(logging.WARNING, logger="ecommerce-agent"):
+        _run(ex.run({"id": "t1", "task": "分析销量", "tool_hint": "write_document"}))
+
+    assert "【建议优先使用】" not in llm.last_messages[0].content, "落在能力之外的提示必须丢掉"
+    assert _names(llm.tools_seen[0]) == sorted(ANALYSIS_SCOPE), "丢提示不影响权限"
+    assert any("不在本次工具范围内" in r.getMessage() for r in caplog.records)
+
+
+def test_executor_keeps_hint_once_scope_allows_it():
+    """同一句 hint，技能放开 document 之后就生效 —— 卡住它的是范围，不是工具名本身"""
+    llm = _RecordingLLM()
+    ex = Executor(llm, _registry())
+    _run(ex.run({"id": "t1", "task": "把周报落盘", "tool_hint": "write_document"},
+                scopes=["analysis", "document"]))
+
+    assert "【建议优先使用】write_document" in llm.last_messages[0].content
 
 
 def test_subset_scopes_unions_and_falls_back(caplog):

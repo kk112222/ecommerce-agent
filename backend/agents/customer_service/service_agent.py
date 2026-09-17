@@ -20,7 +20,9 @@ class ServiceAgent:
 
     def __init__(self, llm, registry):
         self.llm = llm
-        self.registry = registry
+        # 角色级边界：只装 service 范围（search_knowledge_base）。同 ContentAgent ——
+        # 边界靠代码白名单，不靠 prompt；客服 agent 手里没有查数据的工具，越权调用不可能发生
+        self.registry = registry.subset_scopes(["service"])
 
     async def run(self, goal: str, history: str = "", user_profile: str = "") -> str:
         """执行一次客服问答，返回回答字符串"""
