@@ -2,6 +2,7 @@ import json
 import logging
 import uuid
 import weakref
+from contextlib import asynccontextmanager
 from fastapi import Depends
 from backend.db.models.user import User
 from backend.db.models.memory_task import MemoryExtractTask
@@ -39,13 +40,22 @@ _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _EXTRACT_STATS = {"ok": 0, "skipped": 0, "failed": 0, "retried": 0}
 
 
-async def _user_extract_lock(user_id: int) -> asyncio.Lock:
+@asynccontextmanager
+async def _user_extract_lock(user_id: int):
+    """用法：`async with _user_extract_lock(user_id): ...`
+
+    是**异步上下文管理器**，不是"返回一把锁的协程"。两者写错一个字的代价很大：
+    调用处写 `async with`、这里写 `async def ... return lock`，拿到的是 coroutine，
+    直接 TypeError；而提炼跑在后台、异常只进日志，表现出来只是"记忆时有时无"，很难发现。
+    """
     async with _EXTRACT_GUARD:
         lock = _EXTRACT_LOCKS.get(user_id)
         if lock is None:
             lock = asyncio.Lock()
             _EXTRACT_LOCKS[user_id] = lock
-        return lock
+    # 出了 GUARD 本地变量仍强引用着 lock —— 等待期间不会被 WeakValueDictionary 回收
+    async with lock:
+        yield
 
 
 def _spawn(coro) -> asyncio.Task:

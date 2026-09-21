@@ -145,3 +145,38 @@ async def test_trivial_goals_are_skipped(db, monkeypatch):
     await chat._extract_and_save(1, "s1", "谢谢", "不客气")
 
     assert called is False and chat._EXTRACT_STATS["skipped"] == 1
+
+
+# ==================== 提炼主路径（真跑一次 _extract_and_save）====================
+
+async def test_extract_and_save_completes_past_trivial_check(db, monkeypatch):
+    """回归：`_user_extract_lock` 必须能直接用在 `async with` 里
+
+    它以前是普通协程（`async def` + `return lock`），而调用处写的是
+    `async with _user_extract_lock(user_id):` —— 拿到的是 coroutine，直接
+    TypeError: 'coroutine' object does not support the asynchronous context manager protocol。
+
+    为什么以前没测出来：本文件其余用例都把 `_extract_and_save` 整个 monkeypatch 掉了，
+    唯一真调它的 test_trivial_goals_are_skipped 走的是"寒暄"早返回，
+    在加锁那一行**之前**就 return 了 —— 主路径一步都没走到。
+    """
+    class _FakeExtractor:
+        def __init__(self, llm):
+            self.llm = llm
+
+        async def extract(self, conversation, old_profile=None):
+            return {}                    # 空结果 → 语义/情景两条写路径都跳过
+
+    async def _snapshot(user_id):
+        return ""
+
+    monkeypatch.setattr(chat, "create_llm", lambda: object())
+    monkeypatch.setattr(chat, "ProfileExtractor", _FakeExtractor)
+    monkeypatch.setattr(chat, "semantic_snapshot", _snapshot)
+
+    # 用 wait_for 兜住"锁没释放导致挂死"这种改坏法，别让测试无限等
+    await asyncio.wait_for(
+        chat._extract_and_save(1, "s1", "帮我看看这周男装的转化率", "报告正文"),
+        timeout=5,
+    )
+    assert chat._EXTRACT_STATS["ok"] == 1
