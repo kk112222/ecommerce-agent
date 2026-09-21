@@ -477,7 +477,7 @@ prompt 里的输出要求有两条特别值得记：
 
 ```bash
 PYTHONPATH=. python scripts/verify_tool_args.py       # 参数纠错链路
-ls tests/                                             # 150 项离线用例（假 LLM，不联网）
+ls tests/                                             # 151 项离线用例（假 LLM，不联网）
 ```
 
 ---

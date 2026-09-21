@@ -184,7 +184,7 @@ backend/
   db/              # SQLAlchemy 异步模型
 frontend/          # React + TypeScript + antd 聊天界面
 scripts/           # 初始化、灌数据、建库、评测、冒烟脚本
-tests/             # 150 个 pytest 用例
+tests/             # 151 个 pytest 用例
 docs/              # 教程式项目文档（见下）
 ```
 
@@ -193,7 +193,7 @@ docs/              # 教程式项目文档（见下）
 ## 测试与评测
 
 ```bash
-uv run pytest                          # 150 个用例
+uv run pytest                          # 151 个用例
 uv run python -m scripts.rag_eval      # 检索层评测：Recall@5 / Hit@1 / MRR
 ```
 
@@ -226,7 +226,7 @@ uv run python -m scripts.rag_eval      # 检索层评测：Recall@5 / Hit@1 / MR
 | 章节 | 内容 |
 |---|---|
 | [10 踩坑总结](docs/10-踩坑总结.md) | 全项目真实踩过的坑 + 面试速记 |
-| [11 测试与评测](docs/11-测试与评测.md) | 150 项离线用例 + 五把评测尺子 |
+| [11 测试与评测](docs/11-测试与评测.md) | 151 项离线用例 + 五把评测尺子 |
 | [12 RAG 评测四层叙事](docs/12-RAG评测四层叙事.md) | 切分 / 检索 / 生成怎么讲成一条线 |
 
 > [00 项目概述](docs/00-项目概述.md) 里有 `docs/` 全量导航（含面试准备类材料）。
