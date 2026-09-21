@@ -1,0 +1,36 @@
+# 构建上下文会先整个打包传给 docker daemon —— 不排除这些会把几百 MB 白传一遍，
+# 而且 .venv / node_modules 是宿主机（Windows）的产物，进了镜像也不能用。
+.git
+.gitignore
+
+# 宿主机虚拟环境与依赖（镜像里由 uv / npm ci 重新装）
+.venv/
+venv/
+frontend/node_modules/
+frontend/dist/
+
+# 运行期数据：一律靠挂载卷提供，不能烤进镜像
+data_v3.db
+data_v3.db-wal
+data_v3.db-shm
+qdrant_data/
+outputs/
+docker/data/
+logs/
+*.log
+
+# 密钥绝不能进镜像层（进了就算删掉也还在 layer 历史里）
+.env
+
+# 开发期缓存与个人配置
+.idea/
+.vscode/
+.pytest_cache/
+**/__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# 文档与测试不进运行镜像（镜像要小、要快）
+docs/
+tests/

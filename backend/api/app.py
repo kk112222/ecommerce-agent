@@ -80,5 +80,14 @@ app.include_router(session_router, prefix="/api")
 app.include_router(memory_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 
+
+# ===== 运维探针（给 docker healthcheck / nginx 上游检查用）=====
+# 不查库、不调 LLM：探针要的是"进程还活着吗"，查库会把下游故障误报成"没起来"。
+# 放在 /api 之外，免得被 JWT 依赖拦掉（探针不会带 token）。
+@app.get("/health", tags=["运维"], summary="存活探针")
+async def health():
+    return {"status": "ok"}
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

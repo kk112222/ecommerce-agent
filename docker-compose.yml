@@ -1,0 +1,49 @@
+# 单机部署编排：nginx（前端+静态）在前，FastAPI 在后
+# 用 IP 访问，不用域名/HTTPS，所以只对外暴露 80 端口
+#
+#   docker compose up -d --build
+#
+# 首次部署要灌数据（见 docs/24-部署上线.md），否则仪表盘是空的、知识库检索不到东西。
+name: ecommerce-agent
+
+services:
+  backend:
+    build:
+      context: .                            # 上下文是项目根：要拷 backend/ 和 scripts/
+      dockerfile: docker/Dockerfile.backend
+    env_file: .env
+    environment:
+      # 必须在这里显式覆盖：本地 .env 里的 DATABASE_URL 是 Windows 绝对路径
+      # （sqlite+aiosqlite:///D:/pycharm/...），照搬进容器必然找不到库。
+      # 容器内指向数据卷，路径写死成 4 个斜杠 = 绝对路径 /app/data/data_v3.db
+      DATABASE_URL: sqlite+aiosqlite:////app/data/data_v3.db
+    volumes:
+      # 三项全是**目录**挂载，不是文件挂载：
+      # ① WAL 模式会生成 data_v3.db-wal / -shm 兄弟文件，挂单个 .db 会把它们落在
+      #    容器可写层，容器一重建就丢数据；
+      # ② 源路径不存在时 docker 会自动建成空目录，挂文件会变成"目录盖在文件上"，
+      #    SQLite 直接打不开。
+      - ./docker/data/app:/app/data                    # SQLite 库 + WAL 兄弟文件
+      - ./docker/data/qdrant_data:/app/qdrant_data     # Qdrant 本地文件模式
+      - ./docker/data/outputs:/app/outputs             # 生成的文档（前端可下载）
+    expose:
+      - "8000"                                # 只给 compose 内网用，不发布到宿主机
+    restart: unless-stopped
+    healthcheck:
+      # 用 python 而不是 curl/wget：slim 镜像里没装这两个，装了也是白占体积
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s                       # 启动时要补建表 + 记忆对账，给足时间
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "80:80"                               # 唯一对外的入口
+    depends_on:
+      backend:
+        condition: service_healthy            # 后端真起来了再起 nginx，避免首访 502
+    restart: unless-stopped

@@ -1,0 +1,40 @@
+# 后端镜像：Python 3.13 + uv
+# 构建上下文是**项目根目录**（见 docker-compose.yml 的 context: .），不是这个目录
+FROM python:3.13-slim
+
+# uv 官方镜像直接拷二进制进来，比 pip install uv 快且不污染依赖层
+COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /uvx /bin/
+
+# UV_COMPILE_BYTECODE  装完就编译 .pyc，容器冷启动少一层解释开销
+# UV_LINK_MODE=copy    容器里跨层没法硬链接，不设会一直刷 warning
+# PYTHONUNBUFFERED=1   日志立刻落盘，否则 docker logs 会攒着不出（排查时很要命）
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai
+
+# tzdata：slim 镜像默认 UTC，而代码里用的是 datetime.now()（本地时间）。
+# 不装的话容器"今天"会比北京时间晚 8 小时，周报落盘的文件名日期会错一天。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 先只拷依赖清单：改业务代码时这一层缓存不失效，重建从几分钟降到几秒
+# --frozen        严格按 uv.lock 装，不在镜像里重新解析版本（构建可复现）
+# --no-dev        不装 pytest 等开发依赖
+# --no-install-project  本项目不是包（没有 build-system），只装依赖
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY backend/ ./backend/
+COPY scripts/ ./scripts/
+
+ENV PATH="/app/.venv/bin:$PATH"
+
+EXPOSE 8000
+
+# 单进程（不开 --workers）：SQLite 是文件锁，多进程写会加剧锁竞争；
+# 演示规模单进程完全够，真要横向扩时先换 PostgreSQL（见 backend/db/session.py）
+CMD ["uvicorn", "backend.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
