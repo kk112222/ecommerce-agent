@@ -11,11 +11,12 @@
 读完这一章，你会明白：
 
 1. 为什么"一个 ReActAgent 包打天下"不够用
-2. supervisor 这张图怎么组装（7 节点 / 3 条边 / 1 组条件边）
+2. supervisor 这张图怎么组装（8 节点 / 2 条普通边 / 2 组条件边）
 3. 意图路由为什么**必须是同步函数**
 4. planner 怎么把目标拆成**能并行**的子任务，以及怎么校准 LLM 的脏输出
 5. 一个子任务炸了，怎么**不拖垮整轮**（三层异常隔离）
 6. 技能层：怎么把"这件事该按什么口径做"变成可热更新的外部文件
+7. 技能声明的**落盘**为什么是独立后置节点，而不是"给 executor 多开一个工具范围"
 
 ---
 
@@ -64,23 +65,40 @@
    ┌──────────┐        report           report           report
    │synthesize│
    └────┬─────┘
-        ▼
-      report
+        │ 条件边 save_router(state)
+        │
+        ├── 技能声明了 save ──▶ ┌──────┐
+        │                       │ save │  把报告写进文件（可选后置）
+        │                       └──────┘
+        │
+        └── 否则 ──────────────▶ 结束（report 已经流式推给前端了）
 ```
 
-分成两类链路很好记：
+链路和节点，一张表说清（前两行是**链路**，第三行是**节点**，别混）：
 
-| 链路 | 形态 | 为什么这么设计 |
+| 链路 / 节点 | 形态 | 为什么这么设计 |
 |---|---|---|
 | **analysis** | planner → executor×N（并行）→ synthesize | 一个问题要**多个方向**查，查完还要**综合** |
 | **content / service / document** | 单个角色 Agent 跑一次 ReAct | 一件事一次做完：写文案、查政策、生成文档 |
+| **save**（不是链路，是后置节点） | 挂在 synthesize 下游，可选 | 只有技能声明了落盘才走，见 6.4 |
 
-组装代码只有 6 行：
+组装代码全在这里：
 
 ```python
-graph.add_edge("planner", "executor")        # 分析链路：串行
+# 分析链路：串行
+graph.add_edge("planner", "executor")
 graph.add_edge("executor", "synthesize")
 
+# 落盘是 synthesize 的**可选后置**：技能声明了 save 才走，没声明就到 None=结束
+def save_router(state):
+    skill = skills_by_name.get(state.get("skill") or "")
+    return "save" if (skill and skill.save) else "end"
+graph.add_condition_edges("synthesize", save_router, {
+    "save": "save",
+    "end": None,          # None = 终止（invoke 的 while current: 遇假值即退出）
+})
+
+# 条件边：intent 跑完后，根据 state["intent"] 选链路（router 是同步函数）
 def intent_router(state):
     return state.get("intent", "analysis")
 graph.add_condition_edges("intent", intent_router, {
@@ -91,7 +109,8 @@ graph.add_condition_edges("intent", intent_router, {
 graph.entry_point = "intent"
 ```
 
-> 复习一下第 04 章：**普通边控制"一路往下"，条件边控制"分岔"**。整个多 Agent 编排，本质上就是**一条分岔 + 一条串行链**——没有更复杂的东西。
+> 复习一下第 04 章：**普通边控制"一路往下"，条件边控制"分岔"**。整个多 Agent 编排，本质上就是**两条分岔 + 一条串行链**——
+> 一条分岔选链路（intent），一条分岔决定要不要落盘（synthesize），没有更复杂的东西。
 
 ---
 
@@ -306,6 +325,7 @@ name: weekly-report
 title: 经营周报
 when: 用户要"周报 / 月报 / 复盘 / 总结这一周（月）的经营情况"，或要求按固定口径汇总一段时间的整体表现
 scopes: analysis
+save: 经营周报-{date}.md
 ---
 
 # 经营周报
@@ -339,7 +359,35 @@ scopes = skill.scopes if skill else None      # None → executor 用默认的 a
 
 安全性没变：**模型能选的只有"用哪个技能"，选不了"要多大权限"**。范围来自代码里 `TOOL_SCOPES` 的白名单，技能只能声明范围**名字**，不能自己发明权限。
 
-> 现状说明（别被文档带跑）：目前 `backend/skills/` 里**只有 `weekly-report.md` 一个技能**，它声明的 `scopes: analysis`，还没有真正跨角色的技能。跨角色的**能力**已经预留好了（`scopes` 是列表、`subset_scopes` 支持并集），但这条路径还没有实际用例在跑。
+### 6.4 `save`：技能声明的后置落盘
+
+技能除了 `scopes`，还能声明一个 `save:` —— **报告产出之后存成什么文件**（文件名可以带 `{date}` 占位）。真正干这件事的是图里第 8 个节点 `save`。
+
+**为什么是独立节点，而不是"给 executor 放开 document 范围"？** `save_node` 的注释一句话说穿了：
+
+> executor 跑在 synthesize **之前**，`state["report"]` 那时还没诞生 —— 它手里根本没有要落盘的东西。
+
+这句话值得单独记：**工具范围（`scopes`）解决的是"谁有权调"，解决不了"东西还没生成"。** 这是两个不同的问题——
+
+| 问题 | 用什么解 |
+|---|---|
+| 这个角色**能不能**调某个工具 | `scopes` 白名单（6.3） |
+| 这一步**有没有东西可调** | **节点在图里的位置**（6.4） |
+
+落盘对象在报告之后才存在，所以这一步只能挂在 `synthesize` 下游，不能塞进 `executor`。
+
+两条边界，都是踩出来的：
+
+| 边界 | 不这么做的后果 |
+|---|---|
+| **降级报告不落盘** | `synthesize` 走兜底时 state 带 `report_degraded` 标记，`save` 直接返回。**残件混进交付物**，而看文件名完全看不出来 |
+| **落到非用户目录要告警** | 工具的 `user_id`/`session_id` 来自注册时的 context，缺了就落到 `outputs/` 根目录；而下载/列表都以 `outputs/user_<id>/` 为根 → 文件确实在，但**谁都拿不到** |
+
+还有个小设计：**落盘通知不用新造事件**。`write_document` 的 `on_document` 回调会把 `document` 事件塞进 SSE 队列（`chat.py` 把 `queue.put_nowait` 注进了工具 context），前端已有的 `document` 分支会自动给出下载入口 + 时间线步骤——**第 09 章那套"事件流驱动时间线"在这里白捡一个功能**。
+
+> 现状说明（别被文档带跑）：目前 `backend/skills/` 里**只有 `weekly-report.md` 一个技能**，声明 `scopes: analysis` + `save: 经营周报-{date}.md`。
+> 注意"跨角色"这件事最后**没有走"给 executor 放开范围"这条路**，而是用独立后置节点解决的（就是上面这个理由）。
+> `scopes` 是列表、`subset_scopes` 也支持并集，这条路径的能力留着，但目前仍**没有实际用例在跑**。
 
 ---
 
@@ -394,10 +442,13 @@ prompt 里的输出要求有两条特别值得记：
 | `executor_node` | 连降级代码都抛 | `return_exceptions=True` 兜住 |
 | `synthesize_node` | 综合时预算耗尽 | 已流式的部分保留；一个字没有就用子任务结果**拼兜底报告** |
 | `synthesize`（出图） | 数字没把握 | 不加 viz 块，纯文字 |
+| `save_node` | 报告是降级产出 | **不落盘**（残件不混进交付物） |
+| `save_node` | 落盘失败 | 只留警告日志，**不连累已推出去的报告** |
+| `save_node` | 落到了非用户目录 | 警告留痕（文件在，但列表/下载都看不见） |
 
 **贯穿全表的一条原则**：**降级要"少给"，不要"崩"**。用户拿到一份不完整的报告，永远好过一个 500。
 
-> 也正因为降级点这么多，**降级必须留日志**这件事在本项目里出现了三次（工具契约层、子任务隔离、技能退回）。这是一条真正被反复强调的原则，不是写一次就完的话术。
+> 也正因为降级点这么多，**降级必须留日志**这件事在本层里就出现了四次（工具契约层、子任务隔离、技能退回、报告落盘）。这是一条真正被反复强调的原则，不是写一次就完的话术。
 
 ---
 
@@ -426,7 +477,7 @@ prompt 里的输出要求有两条特别值得记：
 
 ```bash
 PYTHONPATH=. python scripts/verify_tool_args.py       # 参数纠错链路
-ls tests/                                             # 136 项离线用例（假 LLM，不联网）
+ls tests/                                             # 150 项离线用例（假 LLM，不联网）
 ```
 
 ---
@@ -434,12 +485,13 @@ ls tests/                                             # 136 项离线用例（�
 ## 本章小结
 
 - **多 Agent ≠ 多模型**：一个 LLM + 多个 prompt 角色 + 多份工具白名单 + 不同执行形态
-- 拓扑只有两种：**analysis 链路（拆解→并行→综合）** 和 **单角色链路（跑一次 ReAct）**
+- 拓扑只有两种链路：**analysis 链路（拆解→并行→综合）** 和 **单角色链路（跑一次 ReAct）**，外加 `synthesize` 之后一个**可选后置节点** `save`
 - **条件边的 router 必须是同步函数**（`invoke` 里没有 `await`）→ 判断结论必须由前一个节点写进 state
 - planner 的地基规则是"**子任务互相独立**"——**没有它就没有并行**
 - **`_sanitize`** 校准脏计划；`while` 里那个自旋 bug 是"异步服务里最贵的 bug"
 - **三层异常隔离**：预算 / 其它异常 / 连降级也抛，**一格失败不拖垮整轮**，但**降级必须留日志**
 - **技能层**：元数据常驻、正文按需加载（渐进披露）；**技能同时决定工具范围**——所以"命中失败"必须退回"没命中"，不能只生效一半
+- **权限问题和时序问题是两码事**：`scopes` 管"谁有权调"，**节点位置**管"东西生成了没"——所以落盘是 `synthesize` 的后置节点，不是给 executor 加权限（6.4）
 - **降级贯穿全链路**：降级要"少给"，不要"崩"
 
 ---
@@ -459,6 +511,16 @@ ls tests/                                             # 136 项离线用例（�
 **挑战三（加分）：给技能层加第二个技能**
 
 写一个 `monthly-rank.md`（月度商品排行，`scopes: analysis`），确认 planner 能在两个技能之间选对；再故意把 `scopes` 写成一个不存在的范围名，看第 02 章的降级规则（放开全集 + 告警）是不是真的生效。
+
+**验收**：一份问题命中它、一份问题落回普通规划；`scopes` 写错时日志里有告警，且**没有崩**。
+
+**挑战四（加分）：亲手验一次落盘的两条边界**
+
+给上面那个新技能加一行 `save: 月度排行-{date}.md`，问一个能命中它的问题，确认：报告末尾出现下载入口、`outputs/user_<id>/` 下真有文件。
+
+然后把 `AGENT_BUDGET_SECONDS` 调到极小（比如 `1`）再问一次 —— 让 `synthesize` 走预算兜底，**这次不应该落盘**。
+
+**验收**：第一次有文件、第二次没有，且日志里有"报告是降级产出，本次不落盘"。这两次对比就是 6.4 那条边界存在的意义。
 
 ---
 

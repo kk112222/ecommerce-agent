@@ -56,7 +56,7 @@ Agent 的完整链路：
     ▼
 [编排层] supervisor —— 自研 AgentGraph 状态图（intent → 条件边路由）
     │
-    ├─ analysis : planner → executor×N（并行 ReAct）→ synthesizer
+    ├─ analysis : planner → executor×N（并行 ReAct）→ synthesizer → save*
     ├─ content  : 内容 Agent（ReAct：标题 / 文案）
     ├─ service  : 客服 Agent（ReAct：查知识库）
     └─ document : 文档 Agent（ReAct：解析 / 生成落盘）
@@ -67,6 +67,9 @@ Agent 的完整链路：
     ▼
 [LLM 层] 通义千问（BaseLLM 抽象 + 预算装饰器，可切换）
 ```
+
+> `save*` 是可选后置节点：命中的技能在 front-matter 里声明了 `save:`（如经营周报）才会走，
+> 负责把报告落盘成文件。**为什么是独立节点而不是给 executor 放开权限**，见 [05 章 6.4](docs/05-多Agent编排.md)。
 
 **三层依赖**是这个项目的骨架：
 
@@ -126,7 +129,7 @@ backend/
   db/              # SQLAlchemy 异步模型
 frontend/          # React + TypeScript + antd 聊天界面
 scripts/           # 初始化、灌数据、建库、评测、冒烟脚本
-tests/             # 136 个 pytest 用例
+tests/             # 150 个 pytest 用例
 docs/              # 教程式项目文档（见下）
 ```
 
@@ -135,7 +138,7 @@ docs/              # 教程式项目文档（见下）
 ## 测试与评测
 
 ```bash
-uv run pytest                          # 136 个用例
+uv run pytest                          # 150 个用例
 uv run python -m scripts.rag_eval      # 检索层评测：Recall@5 / Hit@1 / MRR
 ```
 
@@ -160,7 +163,7 @@ uv run python -m scripts.rag_eval      # 检索层评测：Recall@5 / Hit@1 / MR
 | [07 记忆系统](docs/07-记忆系统.md) | 三层记忆 + 增量合并 + 双存储对账 |
 | [08 API 与认证](docs/08-API与认证.md) | JWT + 依赖注入 + SSE 流式 |
 | [09 前端与总结](docs/09-前端与总结.md) | 事件流 → 执行时间线 + 五条主线总结 |
-| [11 测试与评测](docs/11-测试与评测.md) | 136 项离线用例 + 五把评测尺子（切分/检索/生成/编排） |
+| [11 测试与评测](docs/11-测试与评测.md) | 150 项离线用例 + 五把评测尺子（切分/检索/生成/编排） |
 
 ---
 
